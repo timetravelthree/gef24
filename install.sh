@@ -103,10 +103,13 @@ EOH
 fi
 
 log "Installing Gef24 script into ${HOME}/.local/bin/gef24" info
+set -x
 cat <<EOH >"${HOME}/.local/bin/gef24"
 #!/bin/sh
 #exec gdb -q -ex init-gef24 "$@"
 EOH
+chmod +x ${HOME}/.local/bin/gef24
+set +x
 
 log "Installation finished successfully!" success
 log 'Now try to run `gef24 ${BINARY_NAME}`' success
