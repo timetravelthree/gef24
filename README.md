@@ -29,10 +29,13 @@ python3 "${HOME}/.gdbinit-gef24.py" --upgrade
 
 ### Uninstall
 
+There will also be a command left in `${HOME}/.gdbinit` named `init-gef24` that you must remove
+
 ```sh
-rm -f "${HOME}/.gdbinit-gef24.py" "${HOME}/.gef.rc"
-sed -i -e '/source \/${HOME}\/.gdbinit-gef24.py/d' ${HOME}/.gdbinit
+rm -f "${HOME}/.gdbinit-gef24.py" "${HOME}/.local/bin/gef24"
 ```
+
+Remove the Gef24 source script
 
 
 ### Added/Improved Features
