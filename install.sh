@@ -106,7 +106,7 @@ log "Installing Gef24 script into ${HOME}/.local/bin/gef24" info
 set -x
 cat <<EOH >"${HOME}/.local/bin/gef24"
 #!/bin/sh
-#exec gdb -q -ex init-gef24 "$@"
+exec gdb -q -ex init-gef24 "\$@"
 EOH
 chmod +x ${HOME}/.local/bin/gef24
 set +x
