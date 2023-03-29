@@ -6,7 +6,7 @@
 #
 # original: by @_hugsy_
 # improvement: by @bata_24
-# other improvements: by @XorDante
+# improvement++: by @XorDante
 #
 #######################################################################################
 #
@@ -150,7 +150,7 @@ def update_gef(argv):
     Return 0 on success, 1 on failure. """
     gef_local = os.path.realpath(argv[0])
     hash_gef_local = hashlib.sha512(open(gef_local, "rb").read()).digest()
-    gef_remote = "https://raw.githubusercontent.com/bata24/gef/dev/gef.py"
+    gef_remote = "https://raw.githubusercontent.com/timetravelthree/gef24/dev/gef.py"
     gef_remote_data = http_get(gef_remote)
     if gef_remote_data is None:
         print("[-] Failed to get remote gef")
@@ -12895,6 +12895,7 @@ class UnicornEmulateCommand(GenericCommand):
         content += "#\n"
         content += "# original:  by @_hugsy_\n"
         content += "# improvement: by @bata_24\n"
+        content += "# improvement++: by @XorDante\n"
         content += "#\n"
         content += "from __future__ import print_function\n"
         content += "import sys\n"
@@ -14883,7 +14884,7 @@ class AsmListCommand(GenericCommand):
             return None
 
         # download defines
-        url = 'https://raw.githubusercontent.com/bata24/gef/dev/asmdb/x86data.js'
+        url = 'https://raw.githubusercontent.com/timetravelthree/gef24/dev/asmdb/x86data.js'
         x86 = http_get(url)
         if x86 is None:
             err("Connection timed out: {:s}".format(url))
