@@ -2,12 +2,8 @@
 
 GEF24_INSTALLATION_PATH="${HOME}/.gdbinit-gef24.py"
 
-echo "[+] apt"
-apt-get update
-apt-get install -y gdb-multiarch binutils gcc file python3-pip ruby-dev git
-
 echo "[+] pip3"
-pip3 install crccheck unicorn capstone ropper keystone-engine
+pip3 install ropper keystone-engine
 
 echo "[+] install seccomp-tools, one_gadget"
 if [ "$(command -v seccomp-tools)" ]; then

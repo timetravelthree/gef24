@@ -1,46 +1,57 @@
-## GEF24
+# GEF24
+The aim of this fork is to add some additional features to the already existing [GEF](https://github.com/bata24/gef). You can see a full list of the commands in the original repository. Here, I list only some additional improved features that I have added.
 
-This is a fork of [GEF](https://github.com/bata24/gef) from @bata24.
-The aim of this fork is to just some additional features
+## Acknowledgements
+
+This repository is a fork of [GEF](https://github.com/bata24/gef) from `@bata_24`, which is derived from the original [GEF](https://github.com/hugsy/gef) by `@hugsy`
 
 ## Setup
 
+### Dependencies
+
+Make sure to have at least the following dependencies installed:
+
+```sh
+sudo apt update
+sudo apt install -y gdb-multiarch binutils gcc file ruby-dev git python3-pip python3-crccheck python3-unicorn python3-capstone 
+```
+
 ### Install
 
-```bash
+```sh
 wget -q https://raw.githubusercontent.com/timetravelthree/gef24/dev/install.sh -O- | sh
 ```
 
-### Upgrade (replace itself)
-```bash
-python3 ${HOME}/.gdbinit-gef24.py --upgrade
+### Upgrade (replaces itself)
+```sh
+python3 "${HOME}/.gdbinit-gef24.py" --upgrade
 ```
 
 ### Uninstall
 
-```bash
-rm -f ${HOME}/.gdbinit-gef24.py /${HOME}/.gef.rc
-sed -i -e '/source \/${HOME}\/.gdbinit-gef24.py/d' /${HOME}/.gdbinit
+```sh
+rm -f "${HOME}/.gdbinit-gef24.py" "${HOME}/.gef.rc"
+sed -i -e '/source \/${HOME}\/.gdbinit-gef24.py/d' ${HOME}/.gdbinit
 ```
 
-### Dependency
-See [install.sh](https://github.com/timetravelthree/gef24/blob/dev/install.sh) or
-[install-minimal.sh](https://github.com/timetravelthree/gef24/blob/dev/install-minimal.sh).
 
+### Added/Improved Features
+* Installation without root
+* idtinfo: added command for printing idt gates
+* ksymaddr-*: improved compatibility for most Linux kernels
 
 ## Added / Improved features
 
 - installation without root
-- `idtinfo` -> added command for printing idt gates
-- `ksymaddr-*` -> improved compatibility for most linux kernels
+- `idtinfo` command for printing idt gates
+- `ksymaddr-*` improved compatibility for most linux kernels
 
-## General
-* `idtinfo`: displays the idt gates
-    * It also prints the details each section of the entry
+### General
+* `idtinfo`: displays the IDT gates
+    * It also prints the details of each section of the entry.
     ![](images/interrupt_gates.png)
 
 
 ## Todo
-
-- [ ] Better file structure, this is because of large files are harder to work with excpecially with an IDE
-- [ ] Improve `idtinfo` to add 32 bit support
+ - [ ] Better file structure, for easier organization.
+ - [ ] Improve `idtinfo` to add 32-bit support.
