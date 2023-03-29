@@ -6,6 +6,7 @@
 #
 # original: by @_hugsy_
 # improvement: by @bata_24
+# other improvements: by @XorDante
 #
 #######################################################################################
 #
@@ -44,8 +45,9 @@
 #
 #######################################################################################
 #
-# gef is distributed under the MIT License (MIT)
+# gef24 is distributed under the MIT License (MIT)
 #
+# Copyright (c) 2023-2023 timetravelthree (@XorDante)
 # Copyright (c) 2021-2023 bata24 (@bata_24)
 #
 # This is a fork of GEF (https://github.com/hugsy/gef).
@@ -5802,7 +5804,7 @@ class HPPA(Architecture):
             v2 = insn.operands[1] # source2
             vbit = (insn.opcodes[0] >> 2) & 1
             if vbit:
-                taken, reason = check_cond_bit(c, v1, get_register(v1), v2, int(v2, 16)) # bb,cond,n
+                taken, reason = check_cond_bit(c, v1, get_register(v1), v2, int(v2, 16)) # bv,cond,n
             else:
                 taken, reason = check_cond_bit(c, v1, get_register(v1), v2, get_register(v2)) # bvb,cond,n
 
@@ -6910,10 +6912,7 @@ def read_cstring_from_memory(address, max_length=GEF_MAX_STRING_LENGTH):
 
     # treat as utf-8
     res = res.split(b"\x00")[0]
-    try:
-        ustr = res.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+    ustr = res.decode("utf-8")
     if len(ustr) > max_length:
         ustr = "{}[...]".format(ustr[:max_length])
     return ustr
@@ -7473,7 +7472,7 @@ def to_unsigned_long(v):
     return int(v.cast(gdb.Value(mask).type)) & mask
 
 
-def get_register(regname, use_mbed_exec=False):
+def get_register(regname):
     """Return a register's value."""
     if regname[0] in ["%", "@"]:
         regname = "$" + regname[1:]
@@ -7493,14 +7492,10 @@ def get_register(regname, use_mbed_exec=False):
         try:
             value = gdb.selected_frame().read_register(regname[1:])
             return int(value)
-        except (ValueError, gdb.error):
-            pass
-
-    if use_mbed_exec:
-        r = gdb.execute("read-system-register {:s}".format(regname), to_string=True)
-        if r:
-            return int(r.split("=")[1], 16)
-    return None
+        except ValueError:
+            return None
+        except gdb.error:
+            return None
 
 
 def get_path_from_info_proc():
@@ -7996,53 +7991,53 @@ def __get_explored_regions():
 
     # auxv parse
     auxv = gef_get_auxiliary_values()
+    codebase = auxv.get("AT_PHDR", None) or auxv.get("AT_ENTRY", None)
+
+    # plan1: from link_map info (code, all loaded shared library)
+    link_map = get_link_map(codebase)
+    if link_map:
+        regions += parse_region_from_link_map(link_map)
+
+    # plan2: use each auxv info (for code, linker)
+    elif auxv:
+        # code
+        if "AT_PHDR" in auxv:
+            regions += parse_region_from_ehdr(auxv["AT_PHDR"], _get_filepath() or "[code]")
+        elif "AT_ENTRY" in auxv:
+            regions += parse_region_from_ehdr(auxv["AT_ENTRY"], _get_filepath() or "[code]")
+        # linker
+        if "AT_BASE" in auxv:
+            regions += parse_region_from_ehdr(auxv["AT_BASE"], get_linker(codebase) or "[linker]")
+
+    # vdso
     if auxv:
-        codebase = auxv.get("AT_PHDR", None) or auxv.get("AT_ENTRY", None)
-
-        # plan1: from link_map info (code, all loaded shared library)
-        link_map = get_link_map(codebase)
-        if link_map:
-            regions += parse_region_from_link_map(link_map)
-
-        # plan2: use each auxv info (for code, linker)
-        else:
-            # code
-            if "AT_PHDR" in auxv:
-                regions += parse_region_from_ehdr(auxv["AT_PHDR"], _get_filepath() or "[code]")
-            elif "AT_ENTRY" in auxv:
-                regions += parse_region_from_ehdr(auxv["AT_ENTRY"], _get_filepath() or "[code]")
-            # linker
-            if "AT_BASE" in auxv:
-                regions += parse_region_from_ehdr(auxv["AT_BASE"], get_linker(codebase) or "[linker]")
-
-        # vdso
         if "AT_SYSINFO_EHDR" in auxv:
             regions += parse_region_from_ehdr(auxv["AT_SYSINFO_EHDR"], "[vdso]")
         elif "AT_SYSINFO" in auxv:
             regions += parse_region_from_ehdr(auxv["AT_SYSINFO"], "[vdso]")
 
-        # stack registers
-        stack_permission = "rw-"
-        if auxv and "AT_PHDR" in auxv:
-            elf = get_ehdr(auxv["AT_PHDR"] & gef_getpagesize_mask())
-            for phdr in elf.phdrs:
-                if phdr.p_type != Phdr.PT_GNU_STACK:
-                    continue
-                pflags = {
-                    0                                 : "---",
-                    Phdr.PF_X                         : "--x",
-                    Phdr.PF_W                         : "-w-",
-                    Phdr.PF_R                         : "r--",
-                    Phdr.PF_W | Phdr.PF_X             : "-wx",
-                    Phdr.PF_R | Phdr.PF_X             : "r-x",
-                    Phdr.PF_R | Phdr.PF_W             : "rw-",
-                    Phdr.PF_R | Phdr.PF_W | Phdr.PF_X : "rwx",
-                }
-                stack_permission = pflags[phdr.p_flags]
-                break
-            else:
-                stack_permission = "rwx" # no GNU_STACK phdr means no-NX
-        regions += make_regions(current_arch.sp, "[stack]", stack_permission)
+    # stack registers
+    stack_permission = "rw-"
+    if auxv and "AT_PHDR" in auxv:
+        elf = get_ehdr(auxv["AT_PHDR"] & gef_getpagesize_mask())
+        for phdr in elf.phdrs:
+            if phdr.p_type != Phdr.PT_GNU_STACK:
+                continue
+            pflags = {
+                0                                 : "---",
+                Phdr.PF_X                         : "--x",
+                Phdr.PF_W                         : "-w-",
+                Phdr.PF_R                         : "r--",
+                Phdr.PF_W | Phdr.PF_X             : "-wx",
+                Phdr.PF_R | Phdr.PF_X             : "r-x",
+                Phdr.PF_R | Phdr.PF_W             : "rw-",
+                Phdr.PF_R | Phdr.PF_W | Phdr.PF_X : "rwx",
+            }
+            stack_permission = pflags[phdr.p_flags]
+            break
+        else:
+            stack_permission = "rwx" # no GNU_STACK phdr means no-NX
+    regions += make_regions(current_arch.sp, "[stack]", stack_permission)
 
     # registers
     for regname in current_arch.all_registers:
@@ -8891,16 +8886,8 @@ def get_ksymaddr(sym):
         pass
     # use ksymaddr-remote
     try:
-        res = gdb.execute("ksymaddr-remote --quiet --exact {:s}".format(sym), to_string=True)
+        res = gdb.execute("ksymaddr-remote --silent --exact {:s}".format(sym), to_string=True)
         return int(res.split()[0], 16)
-    except Exception:
-        return None
-
-
-def get_kparam(sym):
-    try:
-        res = gdb.execute("kparam-sysctl --quiet --no-pager --exact --filter {:s}".format(sym), to_string=True)
-        return int(res.split()[2], 16)
     except Exception:
         return None
 
@@ -9049,7 +9036,7 @@ def get_auxiliary_walk(offset=0):
     current = addr - current_arch.ptrsize * 2 - offset
 
     # check readable or not again
-    if not is_valid_addr(current):
+    if not is_valid_addr(addr):
         # something is wrong, maybe stack is pivoted
         return None
 
@@ -10058,6 +10045,20 @@ class VersionCommand(GenericCommand):
         except IOError:
             return 'not found'
 
+    def rp_version(self):
+        try:
+            command = which("rp-lin-x64")
+        except IOError:
+            try:
+                command = which("rp-lin-x86")
+            except IOError:
+                return 'not found'
+        try:
+            res = gef_execute_external([command, "--version"], as_list=True)
+            return res[0]
+        except IOError:
+            return 'not found'
+
     def qemu_version(self):
         return gdb.execute('monitor info version', to_string=True).strip()
 
@@ -10097,6 +10098,7 @@ class VersionCommand(GenericCommand):
         gef_print("objdump:       \t{:s}".format(self.objdump_version()))
         gef_print("seccomp-tools: \t{:s}".format(self.seccomp_tools_version()))
         gef_print("one_gadget:    \t{:s}".format(self.one_gadget_version()))
+        gef_print("rp:            \t{:s}".format(self.rp_version()))
 
         if is_qemu_system():
             gef_print("qemu:          \t{:s}".format(self.qemu_version()))
@@ -11677,13 +11679,9 @@ class ScanSectionCommand(GenericCommand):
 
         if haystack in ["binary", "bin"]:
             haystack = get_filepath(append_proc_root_prefix=False)
-        if is_qemu_usermode() and haystack is None:
-            haystack = "[code]"
 
         if needle in ["binary", "bin"]:
             needle = get_filepath(append_proc_root_prefix=False)
-        if is_qemu_usermode() and needle is None:
-            needle = "[code]"
 
         self.scan(haystack, needle)
         return
@@ -11743,14 +11741,13 @@ class SearchPatternCommand(GenericCommand):
     _aliases_ = ["find"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument('pattern', metavar='PATTERN', help='search target value. "double-espaced string" or 0xXXXXXXXX style.')
     parser.add_argument('--hex', action='store_true', help="interpret PATTERN as hex. invalid character is ignored.")
     parser.add_argument('--big', action='store_true', help="interpret PATTERN as big endian if PATTERN is 0xXXXXXXXX style.")
+    parser.add_argument('section', metavar='SECTION', nargs="?", help="range to search.")
     parser.add_argument('--aligned', type=int, default=1, help="alignment unit. (default: %(default)s)")
-    parser.add_argument('--disable-utf16', action='store_true', help='disable utf16 search if PATTERN is ascii string.')
     parser.add_argument('-v', dest='verbose', action='store_true', help='shows the section you are currently searching.')
-    parser.add_argument('pattern', metavar='PATTERN', help='search target value. "double-espaced string" or 0xXXXXXXXX style.')
-    parser.add_argument('section', metavar='SECTION_OR_START_ADDR', nargs="?", help="section name or starting address of search range.")
-    parser.add_argument('size', metavar='SIZE', nargs="?", help="search range size. valid only when a start address is specified.")
+    parser.add_argument('--disable-utf16', action='store_true', help='disable utf16 search if PATTERN is ascii string.')
     _syntax_ = parser.format_help()
 
     _example_ = "{:s} AAAA                       # search 'AAAA' from whole memory\n".format(_cmdline_)
@@ -11760,7 +11757,6 @@ class SearchPatternCommand(GenericCommand):
     _example_ += "{:s} 0x0000555555554000 stack   # search 0x0000555555554000 (8byte) from stack\n".format(_cmdline_)
     _example_ += "{:s} AAAA binary                # 'binary' means the area executable itself. (only usermode)\n".format(_cmdline_)
     _example_ += "{:s} AAAA 0x400000-0x404000     # search 'AAAA' from specific range\n".format(_cmdline_)
-    _example_ += "{:s} AAAA 0x400000 0x4000       # search 'AAAA' from specific range (another valid format)\n".format(_cmdline_)
     _example_ += "{:s} AAAA heap --aligned 16     # search with aligned".format(_cmdline_)
 
     def print_section(self, section):
@@ -11815,7 +11811,7 @@ class SearchPatternCommand(GenericCommand):
 
     @staticmethod
     def get_process_maps_qemu_system():
-        res = get_maps_by_pagewalk("pagewalk -q -n")
+        res = get_maps_by_pagewalk("pagewalk -q")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -11909,50 +11905,54 @@ class SearchPatternCommand(GenericCommand):
         if not args.disable_utf16 and self.isascii(pattern) and "\\" not in pattern:
             pattern_utf16 = "".join([x + "\\x00" for x in pattern])
 
-        # search from whole memory
-        if args.section is None:
-            info("Searching '{:s}' in whole memory".format(Color.yellowify(pattern)))
-            self.search_pattern(pattern)
-            if pattern_utf16 is not None:
-                info("Searching '{:s}' in whole memory".format(Color.yellowify(pattern_utf16)))
-                self.search_pattern(pattern_utf16)
-
-        # saerch from range
-        elif args.size or re.match(r"(0x)?[0-9a-fA-F]+-(0x)?[0-9a-fA-F]+", args.section):
-            if args.size:
-                try:
-                    start = int(args.section, 16)
-                    end = start + int(args.size, 16)
-                except ValueError:
-                    self.usage()
-                    return
-            else:
+        # section replace
+        if args.section:
+            if re.match(r"(0x)?[0-9a-fA-F]+-(0x)?[0-9a-fA-F]+", args.section):
+                # specified range -> call search_pattern_by_address directly
+                info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern), args.section))
                 start, end = parse_string_range(args.section)
 
-            info("Searching '{:s}' in {:#x}-{:#x}".format(Color.yellowify(pattern), start, end))
-            ret = self.search_pattern_by_address(pattern, start, end)
-            for found_loc in ret:
-                self.print_loc(found_loc)
+                loc = lookup_address(start)
+                if loc.valid:
+                    if args.verbose:
+                        self.print_section(loc) # verbose: always print section before search
+                else:
+                    err("Not found valid memory area")
+                    return
 
-            if pattern_utf16 is not None:
-                info("Searching '{:s}' in {:#x}-{:#x}".format(Color.yellowify(pattern_utf16), start, end))
-                ret = self.search_pattern_by_address(pattern_utf16, start, end)
+                ret = self.search_pattern_by_address(pattern, start, end) # search
+
+                if ret and not args.verbose:
+                    self.print_section(loc) # default: print section if found
+
                 for found_loc in ret:
                     self.print_loc(found_loc)
 
-        # search from section
-        else:
-            if args.section in ["binary", "bin"] and not is_qemu_system():
-                section_name = get_filepath(append_proc_root_prefix=False)
+                if pattern_utf16 is not None:
+                    info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern_utf16), args.section))
+                    ret = self.search_pattern_by_address(pattern_utf16, start, end)
+                    for found_loc in ret:
+                        self.print_loc(found_loc)
             else:
-                section_name = args.section
+                # section name -> call search wrapper
+                if args.section in ["binary", "bin"] and not is_qemu_system():
+                    section_name = get_filepath(append_proc_root_prefix=False)
+                else:
+                    section_name = args.section
 
-            info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern), section_name))
-            self.search_pattern(pattern, section_name)
+                info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern), section_name))
+                self.search_pattern(pattern, section_name)
 
+                if pattern_utf16 is not None:
+                    info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern_utf16), section_name))
+                    self.search_pattern(pattern_utf16, section_name)
+        else:
+            # whole memory -> call search wrapper
+            info("Searching '{:s}' in memory".format(Color.yellowify(pattern)))
+            self.search_pattern(pattern)
             if pattern_utf16 is not None:
-                info("Searching '{:s}' in {:s}".format(Color.yellowify(pattern_utf16), section_name))
-                self.search_pattern(pattern_utf16, section_name)
+                info("Searching '{:s}' in memory".format(Color.yellowify(pattern_utf16)))
+                self.search_pattern(pattern_utf16)
         return
 
 
@@ -12783,758 +12783,6 @@ class MmapMemoryCommand(GenericCommand):
         gef_print(titlify(cmd))
         gdb.execute(cmd)
         reset_gef_caches()
-        return
-
-
-@register_command
-class ReadSystemRegisterCommand(GenericCommand):
-    """Read system register for old qemu."""
-    _cmdline_ = "read-system-register"
-    _category_ = "04-a. Register - View"
-
-    parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument('reg_name', metavar='REGISTER_NAME', help='register name you want to read a value.')
-    _syntax_ = parser.format_help()
-
-    # thanks to https://github.com/gdelugre/ida-arm-system-highlight
-    # Extracted from the XML specifications for v8.7-A (2021-06).
-    AARCH32_COPROC_REGISTERS = {
-        ( "p15", "c0", 0, "c0", 0 )   : ( "MIDR", "Main ID Register" ),
-        ( "p15", "c0", 0, "c0", 1 )   : ( "CTR", "Cache Type Register" ),
-        ( "p15", "c0", 0, "c0", 2 )   : ( "TCMTR", "TCM Type Register" ),
-        ( "p15", "c0", 0, "c0", 3 )   : ( "TLBTR", "TLB Type Register" ),
-        ( "p15", "c0", 0, "c0", 5 )   : ( "MPIDR", "Multiprocessor Affinity Register" ),
-        ( "p15", "c0", 0, "c0", 6 )   : ( "REVIDR", "Revision ID Register" ),
-
-        # Aliases
-        ( "p15", "c0", 0, "c0", 4 )   : ( "MIDR", "Main ID Register" ),
-        ( "p15", "c0", 0, "c0", 7 )   : ( "MIDR", "Main ID Register" ),
-
-        # CPUID registers
-        ( "p15", "c0", 0, "c1", 0 )   : ( "ID_PFR0", "Processor Feature Register 0" ),
-        ( "p15", "c0", 0, "c1", 1 )   : ( "ID_PFR1", "Processor Feature Register 1" ),
-        ( "p15", "c0", 0, "c3", 4 )   : ( "ID_PFR2", "Processor Feature Register 2" ),
-        ( "p15", "c0", 0, "c1", 2 )   : ( "ID_DFR0", "Debug Feature Register 0" ),
-        ( "p15", "c0", 0, "c1", 3 )   : ( "ID_AFR0", "Auxiliary Feature Register 0" ),
-        ( "p15", "c0", 0, "c1", 4 )   : ( "ID_MMFR0", "Memory Model Feature Register 0" ),
-        ( "p15", "c0", 0, "c1", 5 )   : ( "ID_MMFR1", "Memory Model Feature Register 1" ),
-        ( "p15", "c0", 0, "c1", 6 )   : ( "ID_MMFR2", "Memory Model Feature Register 2" ),
-        ( "p15", "c0", 0, "c1", 7 )   : ( "ID_MMFR3", "Memory Model Feature Register 3" ),
-        ( "p15", "c0", 0, "c2", 6 )   : ( "ID_MMFR4", "Memory Model Feature Register 4" ),
-        ( "p15", "c0", 0, "c3", 6 )   : ( "ID_MMFR5", "Memory Model Feature Register 5" ),
-        ( "p15", "c0", 0, "c2", 0 )   : ( "ID_ISAR0", "Instruction Set Attribute Register 0" ),
-        ( "p15", "c0", 0, "c2", 1 )   : ( "ID_ISAR1", "Instruction Set Attribute Register 1" ),
-        ( "p15", "c0", 0, "c2", 2 )   : ( "ID_ISAR2", "Instruction Set Attribute Register 2" ),
-        ( "p15", "c0", 0, "c2", 3 )   : ( "ID_ISAR3", "Instruction Set Attribute Register 3" ),
-        ( "p15", "c0", 0, "c2", 4 )   : ( "ID_ISAR4", "Instruction Set Attribute Register 4" ),
-        ( "p15", "c0", 0, "c2", 5 )   : ( "ID_ISAR5", "Instruction Set Attribute Register 5" ),
-        ( "p15", "c0", 0, "c2", 7 )   : ( "ID_ISAR6", "Instruction Set Attribute Register 6" ),
-
-        ( "p15", "c0", 1, "c0", 0 )   : ( "CCSIDR", "Current Cache Size ID Register" ),
-        ( "p15", "c0", 1, "c0", 2 )   : ( "CCSIDR2", "Current Cache Size ID Register 2" ),
-        ( "p15", "c0", 1, "c0", 1 )   : ( "CLIDR", "Cache Level ID Register" ),
-        ( "p15", "c0", 1, "c0", 7 )   : ( "AIDR", "Auxiliary ID Register" ),
-        ( "p15", "c0", 2, "c0", 0 )   : ( "CSSELR", "Cache Size Selection Register" ),
-        ( "p15", "c0", 4, "c0", 0 )   : ( "VPIDR", "Virtualization Processor ID Register" ),
-        ( "p15", "c0", 4, "c0", 5 )   : ( "VMPIDR", "Virtualization Multiprocessor ID Register" ),
-
-        # System control registers
-        ( "p15", "c1", 0, "c0", 0 )   : ( "SCTLR", "System Control Register" ),
-        ( "p15", "c1", 0, "c0", 1 )   : ( "ACTLR", "Auxiliary Control Register" ),
-        ( "p15", "c1", 0, "c0", 3 )   : ( "ACTLR2", "Auxiliary Control Register 2" ),
-        ( "p15", "c1", 0, "c0", 2 )   : ( "CPACR", "Architectural Feature Access Control Register" ),
-        ( "p15", "c1", 0, "c1", 0 )   : ( "SCR", "Secure Configuration Register" ),
-        ( "p15", "c1", 0, "c1", 1 )   : ( "SDER", "Secure Debug Enable Register" ),
-        ( "p15", "c1", 0, "c3", 1 )   : ( "SDCR", "Secure Debug Control Register" ),
-        ( "p15", "c1", 0, "c1", 2 )   : ( "NSACR", "Non-Secure Access Control Register" ),
-        ( "p15", "c1", 4, "c0", 0 )   : ( "HSCTLR", "Hyp System Control Register" ),
-        ( "p15", "c1", 4, "c0", 1 )   : ( "HACTLR", "Hyp Auxiliary Control Register" ),
-        ( "p15", "c1", 4, "c0", 3 )   : ( "HACTLR2", "Hyp Auxiliary Control Register 2" ),
-        ( "p15", "c1", 4, "c1", 0 )   : ( "HCR", "Hyp Configuration Register" ),
-        ( "p15", "c1", 4, "c1", 4 )   : ( "HCR2", "Hyp Configuration Register 2" ),
-        ( "p15", "c1", 4, "c1", 1 )   : ( "HDCR", "Hyp Debug Control Register" ),
-        ( "p15", "c1", 4, "c1", 2 )   : ( "HCPTR", "Hyp Architectural Feature Trap Register" ),
-        ( "p15", "c1", 4, "c1", 3 )   : ( "HSTR", "Hyp System Trap Register" ),
-        ( "p15", "c1", 4, "c1", 7 )   : ( "HACR", "Hyp Auxiliary Configuration Register" ),
-
-        # Translation Table Base Registers
-        ( "p15", "c2", 0, "c0", 0 )   : ( "TTBR0", "Translation Table Base Register 0" ),
-        ( "p15", "c2", 0, "c0", 1 )   : ( "TTBR1", "Translation Table Base Register 1" ),
-        ( "p15", "c2", 4, "c0", 2 )   : ( "HTCR", "Hyp Translation Control Register" ),
-        ( "p15", "c2", 4, "c1", 2 )   : ( "VTCR", "Virtualization Translation Control Register" ),
-        ( "p15", "c2", 0, "c0", 2 )   : ( "TTBCR", "Translation Table Base Control Register" ),
-        ( "p15", "c2", 0, "c0", 3 )   : ( "TTBCR2", "Translation Table Base Control Register 2" ),
-
-        # Domain Access Control registers
-        ( "p15", "c3", 0, "c0", 0 )   : ( "DACR", "Domain Access Control Register" ),
-
-        # Fault Status registers
-        ( "p15", "c5", 0, "c0", 0 )   : ( "DFSR", "Data Fault Status Register" ),
-        ( "p15", "c5", 0, "c0", 1 )   : ( "IFSR", "Instruction Fault Status Register" ),
-        ( "p15", "c5", 0, "c1", 0 )   : ( "ADFSR", "Auxiliary Data Fault Status Register" ),
-        ( "p15", "c5", 0, "c1", 1 )   : ( "AIFSR", "Auxiliary Instruction Fault Status Register" ),
-        ( "p15", "c5", 4, "c1", 0 )   : ( "HADFSR", "Hyp Auxiliary Data Fault Status Register" ),
-        ( "p15", "c5", 4, "c1", 1 )   : ( "HAIFSR", "Hyp Auxiliary Instruction Fault Status Register" ),
-        ( "p15", "c5", 4, "c2", 0 )   : ( "HSR", "Hyp Syndrome Register" ),
-
-        # Fault Address registers
-        ( "p15", "c6", 0, "c0", 0 )   : ( "DFAR", "Data Fault Address Register" ),
-        ( "p15", "c6", 0, "c0", 1 )   : ( "N/A", "Watchpoint Fault Address" ), # ARM11
-        ( "p15", "c6", 0, "c0", 2 )   : ( "IFAR", "Instruction Fault Address Register" ),
-        ( "p15", "c6", 4, "c0", 0 )   : ( "HDFAR", "Hyp Data Fault Address Register" ),
-        ( "p15", "c6", 4, "c0", 2 )   : ( "HIFAR", "Hyp Instruction Fault Address Register" ),
-        ( "p15", "c6", 4, "c0", 4 )   : ( "HPFAR", "Hyp IPA Fault Address Register" ),
-
-        # Cache maintenance registers
-        ( "p15", "c7", 0, "c0", 4 )   : ( "NOP", "No Operation / Wait For Interrupt" ),
-        ( "p15", "c7", 0, "c1", 0 )   : ( "ICIALLUIS", "Instruction Cache Invalidate All to PoU, Inner Shareable" ),
-        ( "p15", "c7", 0, "c1", 6 )   : ( "BPIALLIS", "Branch Predictor Invalidate All, Inner Shareable" ),
-        ( "p15", "c7", 0, "c4", 0 )   : ( "PAR", "Physical Address Register" ),
-        ( "p15", "c7", 0, "c5", 0 )   : ( "ICIALLU", "Instruction Cache Invalidate All to PoU" ),
-        ( "p15", "c7", 0, "c5", 1 )   : ( "ICIMVAU", "Instruction Cache line Invalidate by VA to PoU" ),
-        ( "p15", "c7", 0, "c5", 2 )   : ( "N/A", "Invalidate all instruction caches by set/way" ), # ARM11
-        ( "p15", "c7", 0, "c5", 4 )   : ( "CP15ISB", "Instruction Synchronization Barrier System instruction" ),
-        ( "p15", "c7", 0, "c5", 6 )   : ( "BPIALL", "Branch Predictor Invalidate All" ),
-        ( "p15", "c7", 0, "c5", 7 )   : ( "BPIMVA", "Branch Predictor Invalidate by VA" ),
-        ( "p15", "c7", 0, "c6", 0 )   : ( "N/A", "Invalidate entire data cache" ),
-        ( "p15", "c7", 0, "c6", 1 )   : ( "DCIMVAC", "Data Cache line Invalidate by VA to PoC" ),
-        ( "p15", "c7", 0, "c6", 2 )   : ( "DCISW", "Data Cache line Invalidate by Set/Way" ),
-        ( "p15", "c7", 0, "c7", 0 )   : ( "N/A", "Invalidate instruction cache and data cache" ), # ARM11
-        ( "p15", "c7", 0, "c8", 0 )   : ( "ATS1CPR", "Address Translate Stage 1 Current state PL1 Read" ),
-        ( "p15", "c7", 0, "c8", 1 )   : ( "ATS1CPW", "Address Translate Stage 1 Current state PL1 Write" ),
-        ( "p15", "c7", 0, "c8", 2 )   : ( "ATS1CUR", "Address Translate Stage 1 Current state Unprivileged Read" ),
-        ( "p15", "c7", 0, "c8", 3 )   : ( "ATS1CUW", "Address Translate Stage 1 Current state Unprivileged Write" ),
-        ( "p15", "c7", 0, "c8", 4 )   : ( "ATS12NSOPR", "Address Translate Stages 1 and 2 Non-secure Only PL1 Read" ),
-        ( "p15", "c7", 0, "c8", 5 )   : ( "ATS12NSOPW", "Address Translate Stages 1 and 2 Non-secure Only PL1 Write" ),
-        ( "p15", "c7", 0, "c8", 6 )   : ( "ATS12NSOUR", "Address Translate Stages 1 and 2 Non-secure Only Unprivileged Read" ),
-        ( "p15", "c7", 0, "c8", 7 )   : ( "ATS12NSOUW", "Address Translate Stages 1 and 2 Non-secure Only Unprivileged Write" ),
-        ( "p15", "c7", 0, "c9", 0 )   : ( "ATS1CPRP", "Address Translate Stage 1 Current state PL1 Read PAN" ),
-        ( "p15", "c7", 0, "c9", 1 )   : ( "ATS1CPWP", "Address Translate Stage 1 Current state PL1 Write PAN" ),
-        ( "p15", "c7", 0, "c10", 0 )  : ( "N/A", "Clean entire data cache" ), # ARM11
-        ( "p15", "c7", 0, "c10", 1 )  : ( "DCCMVAC", "Data Cache line Clean by VA to PoC" ),
-        ( "p15", "c7", 0, "c10", 2 )  : ( "DCCSW", "Data Cache line Clean by Set/Way" ),
-        ( "p15", "c7", 0, "c10", 3 )  : ( "N/A", "Test and clean data cache" ), # ARM9
-        ( "p15", "c7", 0, "c10", 4 )  : ( "CP15DSB", "Data Synchronization Barrier System instruction" ),
-        ( "p15", "c7", 0, "c10", 5 )  : ( "CP15DMB", "Data Memory Barrier System instruction" ),
-        ( "p15", "c7", 0, "c10", 6 )  : ( "N/A", "Read Cache Dirty Status Register" ), # ARM11
-        ( "p15", "c7", 0, "c11", 1 )  : ( "DCCMVAU", "Data Cache line Clean by VA to PoU" ),
-        ( "p15", "c7", 0, "c12", 4 )  : ( "N/A", "Read Block Transfer Status Register" ), # ARM11
-        ( "p15", "c7", 0, "c12", 5 )  : ( "N/A", "Stop Prefetch Range" ), # ARM11
-        ( "p15", "c7", 0, "c13", 1 )  : ( "NOP", "No Operation / Prefetch Instruction Cache Line" ),
-        ( "p15", "c7", 0, "c14", 0 )  : ( "N/A", "Clean and invalidate entire data cache" ), # ARM11
-        ( "p15", "c7", 0, "c14", 1 )  : ( "DCCIMVAC", "Data Cache line Clean and Invalidate by VA to PoC" ),
-        ( "p15", "c7", 0, "c14", 2 )  : ( "DCCISW", "Data Cache line Clean and Invalidate by Set/Way" ),
-        ( "p15", "c7", 0, "c14", 3 )  : ( "N/A", "Test, clean, and invalidate data cache" ), # ARM9
-        ( "p15", "c7", 4, "c8", 0 )   : ( "ATS1HR", "Address Translate Stage 1 Hyp mode Read" ),
-        ( "p15", "c7", 4, "c8", 1 )   : ( "ATS1HW", "Stage 1 Hyp mode write" ),
-
-        # TLB maintenance operations
-        ( "p15", "c8", 0, "c3", 0 )   : ( "TLBIALLIS", "TLB Invalidate All, Inner Shareable" ),
-        ( "p15", "c8", 0, "c3", 1 )   : ( "TLBIMVAIS", "TLB Invalidate by VA, Inner Shareable" ),
-        ( "p15", "c8", 0, "c3", 2 )   : ( "TLBIASIDIS", "TLB Invalidate by ASID match, Inner Shareable" ),
-        ( "p15", "c8", 0, "c3", 3 )   : ( "TLBIMVAAIS", "TLB Invalidate by VA, All ASID, Inner Shareable" ),
-        ( "p15", "c8", 0, "c3", 5 )   : ( "TLBIMVALIS", "TLB Invalidate by VA, Last level, Inner Shareable" ),
-        ( "p15", "c8", 0, "c3", 7 )   : ( "TLBIMVAALIS", "TLB Invalidate by VA, All ASID, Last level, Inner Shareable" ),
-        ( "p15", "c8", 0, "c5", 0 )   : ( "ITLBIALL", "Instruction TLB Invalidate All" ),
-        ( "p15", "c8", 0, "c5", 1 )   : ( "ITLBIMVA", "Instruction TLB Invalidate by VA" ),
-        ( "p15", "c8", 0, "c5", 2 )   : ( "ITLBIASID", "Instruction TLB Invalidate by ASID match" ),
-        ( "p15", "c8", 0, "c6", 0 )   : ( "DTLBIALL", "Data TLB Invalidate All" ),
-        ( "p15", "c8", 0, "c6", 1 )   : ( "DTLBIMVA", "Data TLB Invalidate by VA" ),
-        ( "p15", "c8", 0, "c6", 2 )   : ( "DTLBIASID", "Data TLB Invalidate by ASID match" ),
-        ( "p15", "c8", 0, "c7", 0 )   : ( "TLBIALL", "TLB Invalidate All" ),
-        ( "p15", "c8", 0, "c7", 1 )   : ( "TLBIMVA", "TLB Invalidate by VA" ),
-        ( "p15", "c8", 0, "c7", 2 )   : ( "TLBIASID", "TLB Invalidate by ASID match" ),
-        ( "p15", "c8", 0, "c7", 3 )   : ( "TLBIMVAA", "TLB Invalidate by VA, All ASID" ),
-        ( "p15", "c8", 0, "c7", 5 )   : ( "TLBIMVAL", "TLB Invalidate by VA, Last level" ),
-        ( "p15", "c8", 0, "c7", 7 )   : ( "TLBIMVAAL", "TLB Invalidate by VA, All ASID, Last level" ),
-        ( "p15", "c8", 4, "c0", 1 )   : ( "TLBIIPAS2IS", "TLB Invalidate by Intermediate Physical Address, Stage 2, Inner Shareable" ),
-        ( "p15", "c8", 4, "c0", 5 )   : ( "TLBIIPAS2LIS", "TLB Invalidate by Intermediate Physical Address, Stage 2, Last level, Inner Shareable" ),
-        ( "p15", "c8", 4, "c3", 0 )   : ( "TLBIALLHIS", "TLB Invalidate All, Hyp mode, Inner Shareable" ),
-        ( "p15", "c8", 4, "c3", 1 )   : ( "TLBIMVAHIS", "TLB Invalidate by VA, Hyp mode, Inner Shareable" ),
-        ( "p15", "c8", 4, "c3", 4 )   : ( "TLBIALLNSNHIS", "TLB Invalidate All, Non-Secure Non-Hyp, Inner Shareable" ),
-        ( "p15", "c8", 4, "c3", 5 )   : ( "TLBIMVALHIS", "TLB Invalidate by VA, Last level, Hyp mode, Inner Shareable" ),
-        ( "p15", "c8", 4, "c4", 1 )   : ( "TLBIIPAS2", "TLB Invalidate by Intermediate Physical Address, Stage 2" ),
-        ( "p15", "c8", 4, "c4", 5 )   : ( "TLBIIPAS2L", "TLB Invalidate by Intermediate Physical Address, Stage 2, Last level" ),
-        ( "p15", "c8", 4, "c7", 0 )   : ( "TLBIALLH", "TLB Invalidate All, Hyp mode" ),
-        ( "p15", "c8", 4, "c7", 1 )   : ( "TLBIMVAH", "TLB Invalidate by VA, Hyp mode" ),
-        ( "p15", "c8", 4, "c7", 4 )   : ( "TLBIALLNSNH", "TLB Invalidate All, Non-Secure Non-Hyp" ),
-        ( "p15", "c8", 4, "c7", 5 )   : ( "TLBIMVALH", "TLB Invalidate by VA, Last level, Hyp mode" ),
-
-        ( "p15", "c9", 0, "c0", 0 )   : ( "N/A", "Data Cache Lockdown" ), # ARM11
-        ( "p15", "c9", 0, "c0", 1 )   : ( "N/A", "Instruction Cache Lockdown" ), # ARM11
-        ( "p15", "c9", 0, "c1", 0 )   : ( "N/A", "Data TCM Region" ), # ARM11
-        ( "p15", "c9", 0, "c1", 1 )   : ( "N/A", "Instruction TCM Region" ), # ARM11
-        ( "p15", "c9", 1, "c0", 2 )   : ( "L2CTLR", "L2 Control Register" ),
-        ( "p15", "c9", 1, "c0", 3 )   : ( "L2ECTLR", "L2 Extended Control Register" ),
-
-        # Performance monitor registers
-        ( "p15", "c9", 0, "c12", 0 )  : ( "PMCR", "Performance Monitors Control Register" ),
-        ( "p15", "c9", 0, "c12", 1)   : ( "PMCNTENSET", "Performance Monitor Count Enable Set Register" ),
-        ( "p15", "c9", 0, "c12", 2)   : ( "PMCNTENCLR", "Performance Monitor Control Enable Clear Register" ),
-        ( "p15", "c9", 0, "c12", 3 )  : ( "PMOVSR", "Performance Monitors Overflow Flag Status Register" ),
-        ( "p15", "c9", 0, "c12", 4 )  : ( "PMSWINC", "Performance Monitors Software Increment register" ),
-        ( "p15", "c9", 0, "c12", 5 )  : ( "PMSELR", "Performance Monitors Event Counter Selection Register" ),
-        ( "p15", "c9", 0, "c12", 6 )  : ( "PMCEID0", "Performance Monitors Common Event Identification register 0" ),
-        ( "p15", "c9", 0, "c12", 7 )  : ( "PMCEID1", "Performance Monitors Common Event Identification register 1" ),
-        ( "p15", "c9", 0, "c13", 0 )  : ( "PMCCNTR", "Performance Monitors Cycle Count Register" ),
-        ( "p15", "c9", 0, "c13", 1 )  : ( "PMXEVTYPER", "Performance Monitors Selected Event Type Register" ),
-        ( "p15", "c9", 0, "c13", 2 )  : ( "PMXEVCNTR", "Performance Monitors Selected Event Count Register" ),
-        ( "p15", "c9", 0, "c14", 0 )  : ( "PMUSERENR", "Performance Monitors User Enable Register" ),
-        ( "p15", "c9", 0, "c14", 1 )  : ( "PMINTENSET", "Performance Monitors Interrupt Enable Set register" ),
-        ( "p15", "c9", 0, "c14", 2 )  : ( "PMINTENCLR", "Performance Monitors Interrupt Enable Clear register" ),
-        ( "p15", "c9", 0, "c14", 3 )  : ( "PMOVSSET", "Performance Monitors Overflow Flag Status Set register" ),
-        ( "p15", "c9", 0, "c14", 4 )  : ( "PMCEID2", "Performance Monitors Common Event Identification register 2" ),
-        ( "p15", "c9", 0, "c14", 5 )  : ( "PMCEID3", "Performance Monitors Common Event Identification register 3" ),
-        ( "p15", "c9", 0, "c14", 6 )  : ( "PMMIR", "Performance Monitors Machine Identification Register" ),
-        ( "p15", "c14", 0, "c8", 0 )  : ( "PMEVCNTR0", "Performance Monitors Event Count Register 0" ),
-        ( "p15", "c14", 0, "c8", 1 )  : ( "PMEVCNTR1", "Performance Monitors Event Count Register 1" ),
-        ( "p15", "c14", 0, "c8", 2 )  : ( "PMEVCNTR2", "Performance Monitors Event Count Register 2" ),
-        ( "p15", "c14", 0, "c8", 3 )  : ( "PMEVCNTR3", "Performance Monitors Event Count Register 3" ),
-        ( "p15", "c14", 0, "c8", 4 )  : ( "PMEVCNTR4", "Performance Monitors Event Count Register 4" ),
-        ( "p15", "c14", 0, "c8", 5 )  : ( "PMEVCNTR5", "Performance Monitors Event Count Register 5" ),
-        ( "p15", "c14", 0, "c8", 6 )  : ( "PMEVCNTR6", "Performance Monitors Event Count Register 6" ),
-        ( "p15", "c14", 0, "c8", 7 )  : ( "PMEVCNTR7", "Performance Monitors Event Count Register 7" ),
-        ( "p15", "c14", 0, "c9", 0 )  : ( "PMEVCNTR8", "Performance Monitors Event Count Register 8" ),
-        ( "p15", "c14", 0, "c9", 1 )  : ( "PMEVCNTR9", "Performance Monitors Event Count Register 9" ),
-        ( "p15", "c14", 0, "c9", 2 )  : ( "PMEVCNTR10", "Performance Monitors Event Count Register 10" ),
-        ( "p15", "c14", 0, "c9", 3 )  : ( "PMEVCNTR11", "Performance Monitors Event Count Register 11" ),
-        ( "p15", "c14", 0, "c9", 4 )  : ( "PMEVCNTR12", "Performance Monitors Event Count Register 12" ),
-        ( "p15", "c14", 0, "c9", 5 )  : ( "PMEVCNTR13", "Performance Monitors Event Count Register 13" ),
-        ( "p15", "c14", 0, "c9", 6 )  : ( "PMEVCNTR14", "Performance Monitors Event Count Register 14" ),
-        ( "p15", "c14", 0, "c9", 7 )  : ( "PMEVCNTR15", "Performance Monitors Event Count Register 15" ),
-        ( "p15", "c14", 0, "c10", 0 ) : ( "PMEVCNTR16", "Performance Monitors Event Count Register 16" ),
-        ( "p15", "c14", 0, "c10", 1 ) : ( "PMEVCNTR17", "Performance Monitors Event Count Register 17" ),
-        ( "p15", "c14", 0, "c10", 2 ) : ( "PMEVCNTR18", "Performance Monitors Event Count Register 18" ),
-        ( "p15", "c14", 0, "c10", 3 ) : ( "PMEVCNTR19", "Performance Monitors Event Count Register 19" ),
-        ( "p15", "c14", 0, "c10", 4 ) : ( "PMEVCNTR20", "Performance Monitors Event Count Register 20" ),
-        ( "p15", "c14", 0, "c10", 5 ) : ( "PMEVCNTR21", "Performance Monitors Event Count Register 21" ),
-        ( "p15", "c14", 0, "c10", 6 ) : ( "PMEVCNTR22", "Performance Monitors Event Count Register 22" ),
-        ( "p15", "c14", 0, "c10", 7 ) : ( "PMEVCNTR23", "Performance Monitors Event Count Register 23" ),
-        ( "p15", "c14", 0, "c11", 0 ) : ( "PMEVCNTR24", "Performance Monitors Event Count Register 24" ),
-        ( "p15", "c14", 0, "c11", 1 ) : ( "PMEVCNTR25", "Performance Monitors Event Count Register 25" ),
-        ( "p15", "c14", 0, "c11", 2 ) : ( "PMEVCNTR26", "Performance Monitors Event Count Register 26" ),
-        ( "p15", "c14", 0, "c11", 3 ) : ( "PMEVCNTR27", "Performance Monitors Event Count Register 27" ),
-        ( "p15", "c14", 0, "c11", 4 ) : ( "PMEVCNTR28", "Performance Monitors Event Count Register 28" ),
-        ( "p15", "c14", 0, "c11", 5 ) : ( "PMEVCNTR29", "Performance Monitors Event Count Register 29" ),
-        ( "p15", "c14", 0, "c11", 6 ) : ( "PMEVCNTR30", "Performance Monitors Event Count Register 30" ),
-        ( "p15", "c14", 0, "c12", 0 ) : ( "PMEVTYPER0", "Performance Monitors Event Type Register 0" ),
-        ( "p15", "c14", 0, "c12", 1 ) : ( "PMEVTYPER1", "Performance Monitors Event Type Register 1" ),
-        ( "p15", "c14", 0, "c12", 2 ) : ( "PMEVTYPER2", "Performance Monitors Event Type Register 2" ),
-        ( "p15", "c14", 0, "c12", 3 ) : ( "PMEVTYPER3", "Performance Monitors Event Type Register 3" ),
-        ( "p15", "c14", 0, "c12", 4 ) : ( "PMEVTYPER4", "Performance Monitors Event Type Register 4" ),
-        ( "p15", "c14", 0, "c12", 5 ) : ( "PMEVTYPER5", "Performance Monitors Event Type Register 5" ),
-        ( "p15", "c14", 0, "c12", 6 ) : ( "PMEVTYPER6", "Performance Monitors Event Type Register 6" ),
-        ( "p15", "c14", 0, "c12", 7 ) : ( "PMEVTYPER7", "Performance Monitors Event Type Register 7" ),
-        ( "p15", "c14", 0, "c13", 0 ) : ( "PMEVTYPER8", "Performance Monitors Event Type Register 8" ),
-        ( "p15", "c14", 0, "c13", 1 ) : ( "PMEVTYPER9", "Performance Monitors Event Type Register 9" ),
-        ( "p15", "c14", 0, "c13", 2 ) : ( "PMEVTYPER10", "Performance Monitors Event Type Register 10" ),
-        ( "p15", "c14", 0, "c13", 3 ) : ( "PMEVTYPER11", "Performance Monitors Event Type Register 11" ),
-        ( "p15", "c14", 0, "c13", 4 ) : ( "PMEVTYPER12", "Performance Monitors Event Type Register 12" ),
-        ( "p15", "c14", 0, "c13", 5 ) : ( "PMEVTYPER13", "Performance Monitors Event Type Register 13" ),
-        ( "p15", "c14", 0, "c13", 6 ) : ( "PMEVTYPER14", "Performance Monitors Event Type Register 14" ),
-        ( "p15", "c14", 0, "c13", 7 ) : ( "PMEVTYPER15", "Performance Monitors Event Type Register 15" ),
-        ( "p15", "c14", 0, "c14", 0 ) : ( "PMEVTYPER16", "Performance Monitors Event Type Register 16" ),
-        ( "p15", "c14", 0, "c14", 1 ) : ( "PMEVTYPER17", "Performance Monitors Event Type Register 17" ),
-        ( "p15", "c14", 0, "c14", 2 ) : ( "PMEVTYPER18", "Performance Monitors Event Type Register 18" ),
-        ( "p15", "c14", 0, "c14", 3 ) : ( "PMEVTYPER19", "Performance Monitors Event Type Register 19" ),
-        ( "p15", "c14", 0, "c14", 4 ) : ( "PMEVTYPER20", "Performance Monitors Event Type Register 20" ),
-        ( "p15", "c14", 0, "c14", 5 ) : ( "PMEVTYPER21", "Performance Monitors Event Type Register 21" ),
-        ( "p15", "c14", 0, "c14", 6 ) : ( "PMEVTYPER22", "Performance Monitors Event Type Register 22" ),
-        ( "p15", "c14", 0, "c14", 7 ) : ( "PMEVTYPER23", "Performance Monitors Event Type Register 23" ),
-        ( "p15", "c14", 0, "c15", 0 ) : ( "PMEVTYPER24", "Performance Monitors Event Type Register 24" ),
-        ( "p15", "c14", 0, "c15", 1 ) : ( "PMEVTYPER25", "Performance Monitors Event Type Register 25" ),
-        ( "p15", "c14", 0, "c15", 2 ) : ( "PMEVTYPER26", "Performance Monitors Event Type Register 26" ),
-        ( "p15", "c14", 0, "c15", 3 ) : ( "PMEVTYPER27", "Performance Monitors Event Type Register 27" ),
-        ( "p15", "c14", 0, "c15", 4 ) : ( "PMEVTYPER28", "Performance Monitors Event Type Register 28" ),
-        ( "p15", "c14", 0, "c15", 5 ) : ( "PMEVTYPER29", "Performance Monitors Event Type Register 29" ),
-        ( "p15", "c14", 0, "c15", 6 ) : ( "PMEVTYPER30", "Performance Monitors Event Type Register 30" ),
-        ( "p15", "c14", 0, "c15", 7 ) : ( "PMCCFILTR", "Performance Monitors Cycle Count Filter Register" ),
-
-        # Activity Monitors
-        ( "p15", "c13", 0, "c2", 1 )  : ( "AMCFGR", "Activity Monitors Configuration Register" ),
-        ( "p15", "c13", 0, "c2", 2 )  : ( "AMCGCR", "Activity Monitors Counter Group Configuration Register" ),
-        ( "p15", "c13", 0, "c2", 4 )  : ( "AMCNTENCLR0", "Activity Monitors Count Enable Clear Register 0" ),
-        ( "p15", "c13", 0, "c3", 0 )  : ( "AMCNTENCLR1", "Activity Monitors Count Enable Clear Register 1" ),
-        ( "p15", "c13", 0, "c2", 5 )  : ( "AMCNTENSET0", "Activity Monitors Count Enable Set Register 0" ),
-        ( "p15", "c13", 0, "c3", 1 )  : ( "AMCNTENSET1", "Activity Monitors Count Enable Set Register 1" ),
-        ( "p15", "c13", 0, "c2", 0 )  : ( "AMCR", "Activity Monitors Control Register" ),
-        ( "p15", "c13", 0, "c6", 0 )  : ( "AMEVTYPER00", "Activity Monitors Event Type Registers 0" ),
-        ( "p15", "c13", 0, "c6", 1 )  : ( "AMEVTYPER01", "Activity Monitors Event Type Registers 0" ),
-        ( "p15", "c13", 0, "c6", 2 )  : ( "AMEVTYPER02", "Activity Monitors Event Type Registers 0" ),
-        ( "p15", "c13", 0, "c14", 0 ) : ( "AMEVTYPER10", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 1 ) : ( "AMEVTYPER11", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 2 ) : ( "AMEVTYPER12", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 3 ) : ( "AMEVTYPER13", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 4 ) : ( "AMEVTYPER14", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 5 ) : ( "AMEVTYPER15", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 6 ) : ( "AMEVTYPER16", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c14", 7 ) : ( "AMEVTYPER17", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 0 ) : ( "AMEVTYPER18", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 1 ) : ( "AMEVTYPER19", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 2 ) : ( "AMEVTYPER110", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 3 ) : ( "AMEVTYPER111", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 4 ) : ( "AMEVTYPER112", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 5 ) : ( "AMEVTYPER113", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c15", 6 ) : ( "AMEVTYPER114", "Activity Monitors Event Type Registers 1" ),
-        ( "p15", "c13", 0, "c2", 3 )  : ( "AMUSERENR", "Activity Monitors User Enable Register" ),
-
-        # Reliability
-        ( "p15", "c12", 0, "c1", 1 )  : ( "DISR", "Deferred Interrupt Status Register" ),
-        ( "p15", "c5", 0, "c3", 0 )   : ( "ERRIDR", "Error Record ID Register" ),
-        ( "p15", "c5", 0, "c3", 1 )   : ( "ERRSELR", "Error Record Select Register" ),
-        ( "p15", "c5", 0, "c4", 3 )   : ( "ERXADDR", "Selected Error Record Address Register" ),
-        ( "p15", "c5", 0, "c4", 7 )   : ( "ERXADDR2", "Selected Error Record Address Register 2" ),
-        ( "p15", "c5", 0, "c4", 1 )   : ( "ERXCTLR", "Selected Error Record Control Register" ),
-        ( "p15", "c5", 0, "c4", 5 )   : ( "ERXCTLR2", "Selected Error Record Control Register 2" ),
-        ( "p15", "c5", 0, "c4", 0 )   : ( "ERXFR", "Selected Error Record Feature Register" ),
-        ( "p15", "c5", 0, "c4", 4 )   : ( "ERXFR2", "Selected Error Record Feature Register 2" ),
-        ( "p15", "c5", 0, "c5", 0 )   : ( "ERXMISC0", "Selected Error Record Miscellaneous Register 0" ),
-        ( "p15", "c5", 0, "c5", 1 )   : ( "ERXMISC1", "Selected Error Record Miscellaneous Register 1" ),
-        ( "p15", "c5", 0, "c5", 4 )   : ( "ERXMISC2", "Selected Error Record Miscellaneous Register 2" ),
-        ( "p15", "c5", 0, "c5", 5 )   : ( "ERXMISC3", "Selected Error Record Miscellaneous Register 3" ),
-        ( "p15", "c5", 0, "c5", 2 )   : ( "ERXMISC4", "Selected Error Record Miscellaneous Register 4" ),
-        ( "p15", "c5", 0, "c5", 3 )   : ( "ERXMISC5", "Selected Error Record Miscellaneous Register 5" ),
-        ( "p15", "c5", 0, "c5", 6 )   : ( "ERXMISC6", "Selected Error Record Miscellaneous Register 6" ),
-        ( "p15", "c5", 0, "c5", 7 )   : ( "ERXMISC7", "Selected Error Record Miscellaneous Register 7" ),
-        ( "p15", "c5", 0, "c4", 2 )   : ( "ERXSTATUS", "Selected Error Record Primary Status Register" ),
-        ( "p15", "c5", 4, "c2", 3 )   : ( "VDFSR", "Virtual SError Exception Syndrome Register" ),
-        ( "p15", "c12", 4, "c1", 1 )   : ( "VDISR", "Virtual Deferred Interrupt Status Register" ),
-
-        # Memory attribute registers
-        ( "p15", "c10", 0, "c0", 0 )  : ( "N/A", "TLB Lockdown" ), # ARM11
-        ( "p15", "c10", 0, "c2", 0 )  : ( "MAIR0", "Memory Attribute Indirection Register 0",
-                                          "PRRR", "Primary Region Remap Register" ),
-        ( "p15", "c10", 0, "c2", 1 )  : ( "MAIR1", "Memory Attribute Indirection Register 1",
-                                          "NMRR", "Normal Memory Remap Register" ),
-        ( "p15", "c10", 0, "c3", 0 )  : ( "AMAIR0", "Auxiliary Memory Attribute Indirection Register 0" ),
-        ( "p15", "c10", 0, "c3", 1 )  : ( "AMAIR1", "Auxiliary Memory Attribute Indirection Register 1" ),
-        ( "p15", "c10", 4, "c2", 0 )  : ( "HMAIR0", "Hyp Memory Attribute Indirection Register 0" ),
-        ( "p15", "c10", 4, "c2", 1 )  : ( "HMAIR1", "Hyp Memory Attribute Indirection Register 1" ),
-        ( "p15", "c10", 4, "c3", 0 )  : ( "HAMAIR0", "Hyp Auxiliary Memory Attribute Indirection Register 0" ),
-        ( "p15", "c10", 4, "c3", 1 )  : ( "HAMAIR1", "Hyp Auxiliary Memory Attribute Indirection Register 1" ),
-
-        # DMA registers (ARM11)
-        ( "p15", "c11", 0, "c0", 0 )  : ( "N/A", "DMA Identification and Status (Present)" ),
-        ( "p15", "c11", 0, "c0", 1 )  : ( "N/A", "DMA Identification and Status (Queued)" ),
-        ( "p15", "c11", 0, "c0", 2 )  : ( "N/A", "DMA Identification and Status (Running)" ),
-        ( "p15", "c11", 0, "c0", 3 )  : ( "N/A", "DMA Identification and Status (Interrupting)" ),
-        ( "p15", "c11", 0, "c1", 0 )  : ( "N/A", "DMA User Accessibility" ),
-        ( "p15", "c11", 0, "c2", 0 )  : ( "N/A", "DMA Channel Number" ),
-        ( "p15", "c11", 0, "c3", 0 )  : ( "N/A", "DMA Enable (Stop)" ),
-        ( "p15", "c11", 0, "c3", 1 )  : ( "N/A", "DMA Enable (Start)" ),
-        ( "p15", "c11", 0, "c3", 2 )  : ( "N/A", "DMA Enable (Clear)" ),
-        ( "p15", "c11", 0, "c4", 0 )  : ( "N/A", "DMA Control" ),
-        ( "p15", "c11", 0, "c5", 0 )  : ( "N/A", "DMA Internal Start Address" ),
-        ( "p15", "c11", 0, "c6", 0 )  : ( "N/A", "DMA External Start Address" ),
-        ( "p15", "c11", 0, "c7", 0 )  : ( "N/A", "DMA Internal End Address" ),
-        ( "p15", "c11", 0, "c8", 0 )  : ( "N/A", "DMA Channel Status" ),
-        ( "p15", "c11", 0, "c15", 0)  : ( "N/A", "DMA Context ID" ),
-
-        # Reset management registers.
-        ( "p15", "c12", 0, "c0", 0 )  : ( "VBAR", "Vector Base Address Register" ),
-        ( "p15", "c12", 0, "c0", 1 )  : ( "RVBAR", "Reset Vector Base Address Register" ,
-                                          "MVBAR", "Monitor Vector Base Address Register" ),
-        ( "p15", "c12", 0, "c0", 2 )  : ( "RMR", "Reset Management Register" ),
-        ( "p15", "c12", 4, "c0", 2 )  : ( "HRMR", "Hyp Reset Management Register" ),
-
-        ( "p15", "c12", 0, "c1", 0 )  : ( "ISR", "Interrupt Status Register" ),
-        ( "p15", "c12", 4, "c0", 0 )  : ( "HVBAR", "Hyp Vector Base Address Register" ),
-
-        ( "p15", "c13", 0, "c0", 0 )  : ( "FCSEIDR", "FCSE Process ID register" ),
-        ( "p15", "c13", 0, "c0", 1 )  : ( "CONTEXTIDR", "Context ID Register" ),
-        ( "p15", "c13", 0, "c0", 2 )  : ( "TPIDRURW", "PL0 Read/Write Software Thread ID Register" ),
-        ( "p15", "c13", 0, "c0", 3 )  : ( "TPIDRURO", "PL0 Read-Only Software Thread ID Register" ),
-        ( "p15", "c13", 0, "c0", 4 )  : ( "TPIDRPRW", "PL1 Software Thread ID Register" ),
-        ( "p15", "c13", 4, "c0", 2 )  : ( "HTPIDR", "Hyp Software Thread ID Register" ),
-
-        # Generic timer registers.
-        ( "p15", "c14", 0, "c0", 0 )  : ( "CNTFRQ", "Counter-timer Frequency register" ),
-        ( "p15", "c14", 0, "c1", 0 )  : ( "CNTKCTL", "Counter-timer Kernel Control register" ),
-        ( "p15", "c14", 0, "c2", 0 )  : ( "CNTP_TVAL", "Counter-timer Physical Timer TimerValue register",
-                                          "CNTHP_TVAL", "Counter-timer Hyp Physical Timer TimerValue register",
-                                          "CNTHPS_TVAL", "Counter-timer Secure Physical Timer TimerValue Register (EL2)" ),
-        ( "p15", "c14", 0, "c2", 1 )  : ( "CNTP_CTL", "Counter-timer Physical Timer Control register",
-                                          "CNTHP_CTL", "Counter-timer Hyp Physical Timer Control register",
-                                          "CNTHPS_CTL", "Counter-timer Secure Physical Timer Control Register (EL2)" ),
-        ( "p15", "c14", 0, "c3", 0 )  : ( "CNTV_TVAL", "Counter-timer Virtual Timer TimerValue register",
-                                          "CNTHV_TVAL", "Counter-timer Virtual Timer TimerValue register (EL2)",
-                                          "CNTHVS_TVAL", "Counter-timer Secure Virtual Timer TimerValue Register (EL2)" ),
-        ( "p15", "c14", 0, "c3", 1 )  : ( "CNTV_CTL", "Counter-timer Virtual Timer Control register",
-                                          "CNTHV_CTL", "Counter-timer Virtual Timer Control register (EL2)",
-                                          "CNTHVS_CTL", "Counter-timer Secure Virtual Timer Control Register (EL2)" ),
-        ( "p15", "c14", 4, "c1", 0 )  : ( "CNTHCTL", "Counter-timer Hyp Control register" ),
-        ( "p15", "c14", 4, "c2", 0 )  : ( "CNTHP_TVAL", "Counter-timer Hyp Physical Timer TimerValue register" ),
-        ( "p15", "c14", 4, "c2", 1 )  : ( "CNTHP_CTL", "Counter-timer Hyp Physical Timer Control register" ),
-
-        # Generic interrupt controller registers.
-        ( "p15", "c4", 0, "c6", 0 )   : ( "ICC_PMR", "Interrupt Controller Interrupt Priority Mask Register",
-                                          "ICV_PMR", "Interrupt Controller Virtual Interrupt Priority Mask Register" ),
-        ( "p15", "c12", 0, "c8", 0 )  : ( "ICC_IAR0", "Interrupt Controller Interrupt Acknowledge Register 0",
-                                          "ICV_IAR0", "Interrupt Controller Virtual Interrupt Acknowledge Register 0" ),
-        ( "p15", "c12", 0, "c8", 1 )  : ( "ICC_EOIR0", "Interrupt Controller End Of Interrupt Register 0",
-                                          "ICV_EOIR0", "Interrupt Controller Virtual End Of Interrupt Register 0" ),
-        ( "p15", "c12", 0, "c8", 2 )  : ( "ICC_HPPIR0", "Interrupt Controller Highest Priority Pending Interrupt Register 0",
-                                          "ICV_HPPIR0", "Interrupt Controller Virtual Highest Priority Pending Interrupt Register 0" ),
-        ( "p15", "c12", 0, "c8", 3 )  : ( "ICC_BPR0", "Interrupt Controller Binary Point Register 0",
-                                          "ICV_BPR0", "Interrupt Controller Virtual Binary Point Register 0" ),
-        ( "p15", "c12", 0, "c8", 4 )  : ( "ICC_AP0R0", "Interrupt Controller Active Priorities Group 0 Register 0",
-                                          "ICV_AP0R0", "Interrupt Controller Virtual Active Priorities Group 0 Register 0" ),
-        ( "p15", "c12", 0, "c8", 5 )  : ( "ICC_AP0R1", "Interrupt Controller Active Priorities Group 0 Register 1",
-                                          "ICV_AP0R1", "Interrupt Controller Virtual Active Priorities Group 0 Register 1" ),
-        ( "p15", "c12", 0, "c8", 6 )  : ( "ICC_AP0R2", "Interrupt Controller Active Priorities Group 0 Register 2",
-                                          "ICV_AP0R2", "Interrupt Controller Virtual Active Priorities Group 0 Register 2" ),
-        ( "p15", "c12", 0, "c8", 7 )  : ( "ICC_AP0R3", "Interrupt Controller Active Priorities Group 0 Register 3",
-                                          "ICV_AP0R3", "Interrupt Controller Virtual Active Priorities Group 0 Register 3" ),
-        ( "p15", "c12", 0, "c9", 0 )  : ( "ICC_AP1R0", "Interrupt Controller Active Priorities Group 1 Register 0",
-                                          "ICV_AP1R0", "Interrupt Controller Virtual Active Priorities Group 1 Register 0" ),
-        ( "p15", "c12", 0, "c9", 1 )  : ( "ICC_AP1R1", "Interrupt Controller Active Priorities Group 1 Register 1",
-                                          "ICV_AP1R1", "Interrupt Controller Virtual Active Priorities Group 1 Register 1" ),
-        ( "p15", "c12", 0, "c9", 2 )  : ( "ICC_AP1R2", "Interrupt Controller Active Priorities Group 1 Register 2",
-                                          "ICV_AP1R2", "Interrupt Controller Virtual Active Priorities Group 1 Register 2" ),
-        ( "p15", "c12", 0, "c9", 3 )  : ( "ICC_AP1R3", "Interrupt Controller Active Priorities Group 1 Register 3",
-                                          "ICV_AP1R3", "Interrupt Controller Virtual Active Priorities Group 1 Register 3" ),
-        ( "p15", "c12", 0, "c11", 1 ) : ( "ICC_DIR", "Interrupt Controller Deactivate Interrupt Register",
-                                          "ICV_DIR", "Interrupt Controller Deactivate Virtual Interrupt Register" ),
-        ( "p15", "c12", 0, "c11", 3 ) : ( "ICC_RPR", "Interrupt Controller Running Priority Register",
-                                          "ICV_RPR", "Interrupt Controller Virtual Running Priority Register" ),
-        ( "p15", "c12", 0, "c12", 0 ) : ( "ICC_IAR1", "Interrupt Controller Interrupt Acknowledge Register 1",
-                                          "ICV_IAR1", "Interrupt Controller Virtual Interrupt Acknowledge Register 1" ),
-        ( "p15", "c12", 0, "c12", 1 ) : ( "ICC_EOIR1", "Interrupt Controller End Of Interrupt Register 1",
-                                          "ICV_EOIR1", "Interrupt Controller Virtual End Of Interrupt Register 1" ),
-        ( "p15", "c12", 0, "c12", 2 ) : ( "ICC_HPPIR1", "Interrupt Controller Highest Priority Pending Interrupt Register 1",
-                                          "ICV_HPPIR1", "Interrupt Controller Virtual Highest Priority Pending Interrupt Register 1" ),
-        ( "p15", "c12", 0, "c12", 3 ) : ( "ICC_BPR1", "Interrupt Controller Binary Point Register 1",
-                                          "ICV_BPR1", "Interrupt Controller Virtual Binary Point Register 1" ),
-        ( "p15", "c12", 0, "c12", 4 ) : ( "ICC_CTLR", "Interrupt Controller Control Register",
-                                          "ICV_CTLR", "Interrupt Controller Virtual Control Register" ),
-        ( "p15", "c12", 0, "c12", 5 ) : ( "ICC_SRE", "Interrupt Controller System Register Enable register" ),
-        ( "p15", "c12", 0, "c12", 6 ) : ( "ICC_IGRPEN0", "Interrupt Controller Interrupt Group 0 Enable register",
-                                          "ICV_IGRPEN0", "Interrupt Controller Virtual Interrupt Group 0 Enable register" ),
-        ( "p15", "c12", 0, "c12", 7 ) : ( "ICC_IGRPEN1", "Interrupt Controller Interrupt Group 1 Enable register",
-                                          "ICV_IGRPEN1", "Interrupt Controller Virtual Interrupt Group 1 Enable register" ),
-        ( "p15", "c12", 4, "c8", 0 )  : ( "ICH_AP0R0", "Interrupt Controller Hyp Active Priorities Group 0 Register 0" ),
-        ( "p15", "c12", 4, "c8", 1 )  : ( "ICH_AP0R1", "Interrupt Controller Hyp Active Priorities Group 0 Register 1" ),
-        ( "p15", "c12", 4, "c8", 2 )  : ( "ICH_AP0R2", "Interrupt Controller Hyp Active Priorities Group 0 Register 2" ),
-        ( "p15", "c12", 4, "c8", 3 )  : ( "ICH_AP0R3", "Interrupt Controller Hyp Active Priorities Group 0 Register 3" ),
-        ( "p15", "c12", 4, "c9", 0 )  : ( "ICH_AP1R0", "Interrupt Controller Hyp Active Priorities Group 1 Register 0" ),
-        ( "p15", "c12", 4, "c9", 1 )  : ( "ICH_AP1R1", "Interrupt Controller Hyp Active Priorities Group 1 Register 1" ),
-        ( "p15", "c12", 4, "c9", 2 )  : ( "ICH_AP1R2", "Interrupt Controller Hyp Active Priorities Group 1 Register 2" ),
-        ( "p15", "c12", 4, "c9", 3 )  : ( "ICH_AP1R3", "Interrupt Controller Hyp Active Priorities Group 1 Register 3" ),
-        ( "p15", "c12", 4, "c9", 5 )  : ( "ICC_HSRE", "Interrupt Controller Hyp System Register Enable register" ),
-        ( "p15", "c12", 4, "c11", 0 ) : ( "ICH_HCR", "Interrupt Controller Hyp Control Register" ),
-        ( "p15", "c12", 4, "c11", 1 ) : ( "ICH_VTR", "Interrupt Controller VGIC Type Register" ),
-        ( "p15", "c12", 4, "c11", 2 ) : ( "ICH_MISR", "Interrupt Controller Maintenance Interrupt State Register" ),
-        ( "p15", "c12", 4, "c11", 3 ) : ( "ICH_EISR", "Interrupt Controller End of Interrupt Status Register" ),
-        ( "p15", "c12", 4, "c11", 5 ) : ( "ICH_ELRSR", "Interrupt Controller Empty List Register Status Register" ),
-        ( "p15", "c12", 4, "c11", 7 ) : ( "ICH_VMCR", "Interrupt Controller Virtual Machine Control Register" ),
-        ( "p15", "c12", 4, "c12", 0 ) : ( "ICH_LR0", "Interrupt Controller List Register 0" ),
-        ( "p15", "c12", 4, "c12", 1 ) : ( "ICH_LR1", "Interrupt Controller List Register 1" ),
-        ( "p15", "c12", 4, "c12", 2 ) : ( "ICH_LR2", "Interrupt Controller List Register 2" ),
-        ( "p15", "c12", 4, "c12", 3 ) : ( "ICH_LR3", "Interrupt Controller List Register 3" ),
-        ( "p15", "c12", 4, "c12", 4 ) : ( "ICH_LR4", "Interrupt Controller List Register 4" ),
-        ( "p15", "c12", 4, "c12", 5 ) : ( "ICH_LR5", "Interrupt Controller List Register 5" ),
-        ( "p15", "c12", 4, "c12", 6 ) : ( "ICH_LR6", "Interrupt Controller List Register 6" ),
-        ( "p15", "c12", 4, "c12", 7 ) : ( "ICH_LR7", "Interrupt Controller List Register 7" ),
-        ( "p15", "c12", 4, "c13", 0 ) : ( "ICH_LR8", "Interrupt Controller List Register 8" ),
-        ( "p15", "c12", 4, "c13", 1 ) : ( "ICH_LR9", "Interrupt Controller List Register 9" ),
-        ( "p15", "c12", 4, "c13", 2 ) : ( "ICH_LR10", "Interrupt Controller List Register 10" ),
-        ( "p15", "c12", 4, "c13", 3 ) : ( "ICH_LR11", "Interrupt Controller List Register 11" ),
-        ( "p15", "c12", 4, "c13", 4 ) : ( "ICH_LR12", "Interrupt Controller List Register 12" ),
-        ( "p15", "c12", 4, "c13", 5 ) : ( "ICH_LR13", "Interrupt Controller List Register 13" ),
-        ( "p15", "c12", 4, "c13", 6 ) : ( "ICH_LR14", "Interrupt Controller List Register 14" ),
-        ( "p15", "c12", 4, "c13", 7 ) : ( "ICH_LR15", "Interrupt Controller List Register 15" ),
-        ( "p15", "c12", 4, "c14", 0 ) : ( "ICH_LRC0", "Interrupt Controller List Register 0" ),
-        ( "p15", "c12", 4, "c14", 1 ) : ( "ICH_LRC1", "Interrupt Controller List Register 1" ),
-        ( "p15", "c12", 4, "c14", 2 ) : ( "ICH_LRC2", "Interrupt Controller List Register 2" ),
-        ( "p15", "c12", 4, "c14", 3 ) : ( "ICH_LRC3", "Interrupt Controller List Register 3" ),
-        ( "p15", "c12", 4, "c14", 4 ) : ( "ICH_LRC4", "Interrupt Controller List Register 4" ),
-        ( "p15", "c12", 4, "c14", 5 ) : ( "ICH_LRC5", "Interrupt Controller List Register 5" ),
-        ( "p15", "c12", 4, "c14", 6 ) : ( "ICH_LRC6", "Interrupt Controller List Register 6" ),
-        ( "p15", "c12", 4, "c14", 7 ) : ( "ICH_LRC7", "Interrupt Controller List Register 7" ),
-        ( "p15", "c12", 4, "c15", 0 ) : ( "ICH_LRC8", "Interrupt Controller List Register 8" ),
-        ( "p15", "c12", 4, "c15", 1 ) : ( "ICH_LRC9", "Interrupt Controller List Register 9" ),
-        ( "p15", "c12", 4, "c15", 2 ) : ( "ICH_LRC10", "Interrupt Controller List Register 10" ),
-        ( "p15", "c12", 4, "c15", 3 ) : ( "ICH_LRC11", "Interrupt Controller List Register 11" ),
-        ( "p15", "c12", 4, "c15", 4 ) : ( "ICH_LRC12", "Interrupt Controller List Register 12" ),
-        ( "p15", "c12", 4, "c15", 5 ) : ( "ICH_LRC13", "Interrupt Controller List Register 13" ),
-        ( "p15", "c12", 4, "c15", 6 ) : ( "ICH_LRC14", "Interrupt Controller List Register 14" ),
-        ( "p15", "c12", 4, "c15", 7 ) : ( "ICH_LRC15", "Interrupt Controller List Register 15" ),
-        ( "p15", "c12", 6, "c12", 4 ) : ( "ICC_MCTLR", "Interrupt Controller Monitor Control Register" ),
-        ( "p15", "c12", 6, "c12", 5 ) : ( "ICC_MSRE", "Interrupt Controller Monitor System Register Enable register" ),
-        ( "p15", "c12", 6, "c12", 7 ) : ( "ICC_MGRPEN1", "Interrupt Controller Monitor Interrupt Group 1 Enable register" ),
-
-        ( "p15", "c15", 0, "c0", 0 )  : ( "IL1Data0", "Instruction L1 Data n Register" ),
-        ( "p15", "c15", 0, "c0", 1 )  : ( "IL1Data1", "Instruction L1 Data n Register" ),
-        ( "p15", "c15", 0, "c0", 2 )  : ( "IL1Data2", "Instruction L1 Data n Register" ),
-        ( "p15", "c15", 0, "c1", 0 )  : ( "DL1Data0", "Data L1 Data n Register" ),
-        ( "p15", "c15", 0, "c1", 1 )  : ( "DL1Data1", "Data L1 Data n Register" ),
-        ( "p15", "c15", 0, "c1", 2 )  : ( "DL1Data2", "Data L1 Data n Register" ),
-        ( "p15", "c15", 0, "c2", 0 )  : ( "N/A", "Data Memory Remap" ), # ARM11
-        ( "p15", "c15", 0, "c2", 1 )  : ( "N/A", "Instruction Memory Remap" ), # ARM11
-        ( "p15", "c15", 0, "c2", 2 )  : ( "N/A", "DMA Memory Remap" ), # ARM11
-        ( "p15", "c15", 0, "c2", 3 )  : ( "N/A", "Peripheral Port Memory Remap" ), # ARM11
-        ( "p15", "c15", 0, "c4", 0 )  : ( "RAMINDEX", "RAM Index Register" ),
-        ( "p15", "c15", 0, "c12", 0 ) : ( "N/A", "Performance Monitor Control" ), #ARM11
-        ( "p15", "c15", 0, "c12", 1 ) : ( "CCNT", "Cycle Counter" ), #ARM11
-        ( "p15", "c15", 0, "c12", 2 ) : ( "PMN0", "Count 0" ), #ARM11
-        ( "p15", "c15", 0, "c12", 3 ) : ( "PMN1", "Count 1" ), #ARM11
-        ( "p15", "c15", 1, "c0", 0 )  : ( "L2ACTLR", "L2 Auxiliary Control Register" ),
-        ( "p15", "c15", 1, "c0", 3 )  : ( "L2FPR", "L2 Prefetch Control Register" ),
-        ( "p15", "c15", 3, "c0", 0 )  : ( "N/A", "Data Debug Cache" ), # ARM11
-        ( "p15", "c15", 3, "c0", 1 )  : ( "N/A", "Instruction Debug Cache" ), # ARM11
-        ( "p15", "c15", 3, "c2", 0 )  : ( "N/A", "Data Tag RAM Read Operation" ), # ARM11
-        ( "p15", "c15", 3, "c2", 1 )  : ( "N/A", "Instruction Tag RAM Read Operation" ), # ARM11
-        ( "p15", "c15", 4, "c0", 0 )  : ( "CBAR", "Configuration Base Address Register" ),
-        ( "p15", "c15", 5, "c4", 0 )  : ( "N/A", "Data MicroTLB Index" ), # ARM11
-        ( "p15", "c15", 5, "c4", 1 )  : ( "N/A", "Instruction MicroTLB Index" ), # ARM11
-        ( "p15", "c15", 5, "c4", 2 )  : ( "N/A", "Read Main TLB Entry" ), # ARM11
-        ( "p15", "c15", 5, "c4", 4 )  : ( "N/A", "Write Main TLB Entry" ), # ARM11
-        ( "p15", "c15", 5, "c5", 0 )  : ( "N/A", "Data MicroTLB VA" ), # ARM11
-        ( "p15", "c15", 5, "c5", 1 )  : ( "N/A", "Instruction MicroTLB VA" ), # ARM11
-        ( "p15", "c15", 5, "c5", 2 )  : ( "N/A", "Main TLB VA" ), # ARM11
-        ( "p15", "c15", 5, "c7", 0 )  : ( "N/A", "Data MicroTLB Attribute" ), # ARM11
-        ( "p15", "c15", 5, "c7", 1 )  : ( "N/A", "Instruction MicroTLB Attribute" ), # ARM11
-        ( "p15", "c15", 5, "c7", 2 )  : ( "N/A", "Main TLB Attribute" ), # ARM11
-        ( "p15", "c15", 7, "c0", 0 )  : ( "N/A", "Cache Debug Control" ), # ARM11
-        ( "p15", "c15", 7, "c1", 0 )  : ( "N/A", "TLB Debug Control" ), # ARM11
-
-        # Preload Engine control registers
-        ( "p15", "c11", 0, "c0", 0 )   : ( "PLEIDR", "Preload Engine ID Register" ),
-        ( "p15", "c11", 0, "c0", 2 )   : ( "PLEASR", "Preload Engine Activity Status Register" ),
-        ( "p15", "c11", 0, "c0", 4 )   : ( "PLEFSR", "Preload Engine FIFO Status Register" ),
-        ( "p15", "c11", 0, "c1", 0 )   : ( "PLEUAR", "Preload Engine User Accessibility Register" ),
-        ( "p15", "c11", 0, "c1", 1 )   : ( "PLEPCR", "Preload Engine Parameters Control Register" ),
-
-        # Preload Engine operations
-        ( "p15", "c11", 0, "c2", 1 )   : ( "PLEFF", "Preload Engine FIFO flush operation" ),
-        ( "p15", "c11", 0, "c3", 0 )   : ( "PLEPC", "Preload Engine pause channel operation" ),
-        ( "p15", "c11", 0, "c3", 1 )   : ( "PLERC", "Preload Engine resume channel operation" ),
-        ( "p15", "c11", 0, "c3", 2 )   : ( "PLEKC", "Preload Engine kill channel operation" ),
-
-        # Jazelle registers
-        ( "p14", "c0", 7, "c0", 0 )   : ( "JIDR", "Jazelle ID Register" ),
-        ( "p14", "c1", 7, "c0", 0 )   : ( "JOSCR", "Jazelle OS Control Register" ),
-        ( "p14", "c2", 7, "c0", 0 )   : ( "JMCR", "Jazelle Main Configuration Register" ),
-
-        # Debug registers
-        ( "p15", "c4", 3, "c5", 0 )   : ( "DSPSR", "Debug Saved Program Status Register" ),
-        ( "p15", "c4", 3, "c5", 1 )   : ( "DLR", "Debug Link Register" ),
-        ( "p15", "c0", 0, "c3", 5 )   : ( "ID_DFR1", "Debug Feature Register 1" ),
-        ( "p14", "c0", 0, "c0", 0 )   : ( "DBGDIDR", "Debug ID Register" ),
-        ( "p14", "c0", 0, "c6", 0 )   : ( "DBGWFAR", "Debug Watchpoint Fault Address Register" ),
-        ( "p14", "c0", 0, "c6", 2 )   : ( "DBGOSECCR", "Debug OS Lock Exception Catch Control Register" ),
-        ( "p14", "c0", 0, "c7", 0 )   : ( "DBGVCR", "Debug Vector Catch Register" ),
-        ( "p14", "c0", 0, "c0", 2 )   : ( "DBGDTRRXext", "Debug OS Lock Data Transfer Register, Receive, External View" ),
-        ( "p14", "c0", 0, "c2", 0 )   : ( "DBGDCCINT", "DCC Interrupt Enable Register" ),
-        ( "p14", "c0", 0, "c2", 2 )   : ( "DBGDSCRext", "Debug Status and Control Register, External View" ),
-        ( "p14", "c0", 0, "c3", 2 )   : ( "DBGDTRTXext", "Debug OS Lock Data Transfer Register, Transmit" ),
-        ( "p14", "c0", 0, "c0", 4 )   : ( "DBGBVR0", "Debug Breakpoint Value Register 0" ),
-        ( "p14", "c0", 0, "c1", 4 )   : ( "DBGBVR1", "Debug Breakpoint Value Register 1" ),
-        ( "p14", "c0", 0, "c2", 4 )   : ( "DBGBVR2", "Debug Breakpoint Value Register 2" ),
-        ( "p14", "c0", 0, "c3", 4 )   : ( "DBGBVR3", "Debug Breakpoint Value Register 3" ),
-        ( "p14", "c0", 0, "c4", 4 )   : ( "DBGBVR4", "Debug Breakpoint Value Register 4" ),
-        ( "p14", "c0", 0, "c5", 4 )   : ( "DBGBVR5", "Debug Breakpoint Value Register 5" ),
-        ( "p14", "c0", 0, "c6", 4 )   : ( "DBGBVR6", "Debug Breakpoint Value Register 6" ),
-        ( "p14", "c0", 0, "c7", 4 )   : ( "DBGBVR7", "Debug Breakpoint Value Register 7" ),
-        ( "p14", "c0", 0, "c8", 4 )   : ( "DBGBVR8", "Debug Breakpoint Value Register 8" ),
-        ( "p14", "c0", 0, "c9", 4 )   : ( "DBGBVR9", "Debug Breakpoint Value Register 9" ),
-        ( "p14", "c0", 0, "c10", 4 )  : ( "DBGBVR10", "Debug Breakpoint Value Register 10" ),
-        ( "p14", "c0", 0, "c11", 4 )  : ( "DBGBVR11", "Debug Breakpoint Value Register 11" ),
-        ( "p14", "c0", 0, "c12", 4 )  : ( "DBGBVR12", "Debug Breakpoint Value Register 12" ),
-        ( "p14", "c0", 0, "c13", 4 )  : ( "DBGBVR13", "Debug Breakpoint Value Register 13" ),
-        ( "p14", "c0", 0, "c14", 4 )  : ( "DBGBVR14", "Debug Breakpoint Value Register 14" ),
-        ( "p14", "c0", 0, "c15", 4 )  : ( "DBGBVR15", "Debug Breakpoint Value Register 15" ),
-        ( "p14", "c0", 0, "c0", 5 )   : ( "DBGBCR0", "Debug Breakpoint Control Register 0" ),
-        ( "p14", "c0", 0, "c1", 5 )   : ( "DBGBCR1", "Debug Breakpoint Control Register 1" ),
-        ( "p14", "c0", 0, "c2", 5 )   : ( "DBGBCR2", "Debug Breakpoint Control Register 2" ),
-        ( "p14", "c0", 0, "c3", 5 )   : ( "DBGBCR3", "Debug Breakpoint Control Register 3" ),
-        ( "p14", "c0", 0, "c4", 5 )   : ( "DBGBCR4", "Debug Breakpoint Control Register 4" ),
-        ( "p14", "c0", 0, "c5", 5 )   : ( "DBGBCR5", "Debug Breakpoint Control Register 5" ),
-        ( "p14", "c0", 0, "c6", 5 )   : ( "DBGBCR6", "Debug Breakpoint Control Register 6" ),
-        ( "p14", "c0", 0, "c7", 5 )   : ( "DBGBCR7", "Debug Breakpoint Control Register 7" ),
-        ( "p14", "c0", 0, "c8", 5 )   : ( "DBGBCR8", "Debug Breakpoint Control Register 8" ),
-        ( "p14", "c0", 0, "c9", 5 )   : ( "DBGBCR9", "Debug Breakpoint Control Register 9" ),
-        ( "p14", "c0", 0, "c10", 5 )  : ( "DBGBCR10", "Debug Breakpoint Control Register 10" ),
-        ( "p14", "c0", 0, "c11", 5 )  : ( "DBGBCR11", "Debug Breakpoint Control Register 11" ),
-        ( "p14", "c0", 0, "c12", 5 )  : ( "DBGBCR12", "Debug Breakpoint Control Register 12" ),
-        ( "p14", "c0", 0, "c13", 5 )  : ( "DBGBCR13", "Debug Breakpoint Control Register 13" ),
-        ( "p14", "c0", 0, "c14", 5 )  : ( "DBGBCR14", "Debug Breakpoint Control Register 14" ),
-        ( "p14", "c0", 0, "c15", 5 )  : ( "DBGBCR15", "Debug Breakpoint Control Register 15" ),
-        ( "p14", "c0", 0, "c0", 6 )   : ( "DBGWVR0", "Debug Watchpoint Value Register 0" ),
-        ( "p14", "c0", 0, "c1", 6 )   : ( "DBGWVR1", "Debug Watchpoint Value Register 1" ),
-        ( "p14", "c0", 0, "c2", 6 )   : ( "DBGWVR2", "Debug Watchpoint Value Register 2" ),
-        ( "p14", "c0", 0, "c3", 6 )   : ( "DBGWVR3", "Debug Watchpoint Value Register 3" ),
-        ( "p14", "c0", 0, "c4", 6 )   : ( "DBGWVR4", "Debug Watchpoint Value Register 4" ),
-        ( "p14", "c0", 0, "c5", 6 )   : ( "DBGWVR5", "Debug Watchpoint Value Register 5" ),
-        ( "p14", "c0", 0, "c6", 6 )   : ( "DBGWVR6", "Debug Watchpoint Value Register 6" ),
-        ( "p14", "c0", 0, "c7", 6 )   : ( "DBGWVR7", "Debug Watchpoint Value Register 7" ),
-        ( "p14", "c0", 0, "c8", 6 )   : ( "DBGWVR8", "Debug Watchpoint Value Register 8" ),
-        ( "p14", "c0", 0, "c9", 6 )   : ( "DBGWVR9", "Debug Watchpoint Value Register 9" ),
-        ( "p14", "c0", 0, "c10", 6 )  : ( "DBGWVR10", "Debug Watchpoint Value Register 10" ),
-        ( "p14", "c0", 0, "c11", 6 )  : ( "DBGWVR11", "Debug Watchpoint Value Register 11" ),
-        ( "p14", "c0", 0, "c12", 6 )  : ( "DBGWVR12", "Debug Watchpoint Value Register 12" ),
-        ( "p14", "c0", 0, "c13", 6 )  : ( "DBGWVR13", "Debug Watchpoint Value Register 13" ),
-        ( "p14", "c0", 0, "c14", 6 )  : ( "DBGWVR14", "Debug Watchpoint Value Register 14" ),
-        ( "p14", "c0", 0, "c15", 6 )  : ( "DBGWVR15", "Debug Watchpoint Value Register 15" ),
-        ( "p14", "c0", 0, "c0", 7 )   : ( "DBGWCR0", "Debug Watchpoint Control Register 0" ),
-        ( "p14", "c0", 0, "c1", 7 )   : ( "DBGWCR1", "Debug Watchpoint Control Register 1" ),
-        ( "p14", "c0", 0, "c2", 7 )   : ( "DBGWCR2", "Debug Watchpoint Control Register 2" ),
-        ( "p14", "c0", 0, "c3", 7 )   : ( "DBGWCR3", "Debug Watchpoint Control Register 3" ),
-        ( "p14", "c0", 0, "c4", 7 )   : ( "DBGWCR4", "Debug Watchpoint Control Register 4" ),
-        ( "p14", "c0", 0, "c5", 7 )   : ( "DBGWCR5", "Debug Watchpoint Control Register 5" ),
-        ( "p14", "c0", 0, "c6", 7 )   : ( "DBGWCR6", "Debug Watchpoint Control Register 6" ),
-        ( "p14", "c0", 0, "c7", 7 )   : ( "DBGWCR7", "Debug Watchpoint Control Register 7" ),
-        ( "p14", "c0", 0, "c8", 7 )   : ( "DBGWCR8", "Debug Watchpoint Control Register 8" ),
-        ( "p14", "c0", 0, "c9", 7 )   : ( "DBGWCR9", "Debug Watchpoint Control Register 9" ),
-        ( "p14", "c0", 0, "c10", 7 )  : ( "DBGWCR10", "Debug Watchpoint Control Register 10" ),
-        ( "p14", "c0", 0, "c11", 7 )  : ( "DBGWCR11", "Debug Watchpoint Control Register 11" ),
-        ( "p14", "c0", 0, "c12", 7 )  : ( "DBGWCR12", "Debug Watchpoint Control Register 12" ),
-        ( "p14", "c0", 0, "c13", 7 )  : ( "DBGWCR13", "Debug Watchpoint Control Register 13" ),
-        ( "p14", "c0", 0, "c14", 7 )  : ( "DBGWCR14", "Debug Watchpoint Control Register 14" ),
-        ( "p14", "c0", 0, "c15", 7 )  : ( "DBGWCR15", "Debug Watchpoint Control Register 15" ),
-        ( "p14", "c1", 0, "c0", 1 )   : ( "DBGBXVR0", "Debug Breakpoint Extended Value Register 0" ),
-        ( "p14", "c1", 0, "c1", 1 )   : ( "DBGBXVR1", "Debug Breakpoint Extended Value Register 1" ),
-        ( "p14", "c1", 0, "c2", 1 )   : ( "DBGBXVR2", "Debug Breakpoint Extended Value Register 2" ),
-        ( "p14", "c1", 0, "c3", 1 )   : ( "DBGBXVR3", "Debug Breakpoint Extended Value Register 3" ),
-        ( "p14", "c1", 0, "c4", 1 )   : ( "DBGBXVR4", "Debug Breakpoint Extended Value Register 4" ),
-        ( "p14", "c1", 0, "c5", 1 )   : ( "DBGBXVR5", "Debug Breakpoint Extended Value Register 5" ),
-        ( "p14", "c1", 0, "c6", 1 )   : ( "DBGBXVR6", "Debug Breakpoint Extended Value Register 6" ),
-        ( "p14", "c1", 0, "c7", 1 )   : ( "DBGBXVR7", "Debug Breakpoint Extended Value Register 7" ),
-        ( "p14", "c1", 0, "c8", 1 )   : ( "DBGBXVR8", "Debug Breakpoint Extended Value Register 8" ),
-        ( "p14", "c1", 0, "c9", 1 )   : ( "DBGBXVR9", "Debug Breakpoint Extended Value Register 9" ),
-        ( "p14", "c1", 0, "c10", 1 )  : ( "DBGBXVR10", "Debug Breakpoint Extended Value Register 10" ),
-        ( "p14", "c1", 0, "c11", 1 )  : ( "DBGBXVR11", "Debug Breakpoint Extended Value Register 11" ),
-        ( "p14", "c1", 0, "c12", 1 )  : ( "DBGBXVR12", "Debug Breakpoint Extended Value Register 12" ),
-        ( "p14", "c1", 0, "c13", 1 )  : ( "DBGBXVR13", "Debug Breakpoint Extended Value Register 13" ),
-        ( "p14", "c1", 0, "c14", 1 )  : ( "DBGBXVR14", "Debug Breakpoint Extended Value Register 14" ),
-        ( "p14", "c1", 0, "c15", 1 )  : ( "DBGBXVR15", "Debug Breakpoint Extended Value Register 15" ),
-        ( "p14", "c1", 0, "c0", 4 )   : ( "DBGOSLAR", "Debug OS Lock Access Register" ),
-        ( "p14", "c1", 0, "c1", 4 )   : ( "DBGOSLSR", "Debug OS Lock Status Register" ),
-        ( "p14", "c1", 0, "c4", 4 )   : ( "DBGPRCR", "Debug Power Control Register" ),
-        ( "p14", "c7", 0, "c14", 6 )  : ( "DBGAUTHSTATUS", "Debug Authentication Status register" ),
-        ( "p14", "c7", 0, "c0", 7 )   : ( "DBGDEVID2", "Debug Device ID register 2" ),
-        ( "p14", "c7", 0, "c1", 7 )   : ( "DBGDEVID1", "Debug Device ID register 1" ),
-        ( "p14", "c7", 0, "c2", 7 )   : ( "DBGDEVID", "Debug Device ID register 0" ),
-        ( "p14", "c7", 0, "c8", 6 )   : ( "DBGCLAIMSET", "Debug Claim Tag Set register" ),
-        ( "p14", "c7", 0, "c9", 6 )   : ( "DBGCLAIMCLR", "Debug Claim Tag Clear register" ),
-        ( "p14", "c0", 0, "c1", 0 )   : ( "DBGDSCRint", "Debug Status and Control Register, Internal View" ),
-        ( "p14", "c0", 0, "c5", 0 )   : ( "DBGDTRRXint", "Debug Data Transfer Register, Receive",
-                                          "DBGDTRTXint", "Debug Data Transfer Register, Transmit" ),
-        ( "p14", "c1", 0, "c0", 0 )   : ( "DBGDRAR", "Debug ROM Address Register" ),
-        ( "p14", "c1", 0, "c3", 4 )   : ( "DBGOSDLR", "Debug OS Double Lock Register" ),
-        ( "p14", "c2", 0, "c0", 0 )   : ( "DBGDSAR", "Debug Self Address Register" ),
-        ( "p15", "c1", 4, "c2", 1 )   : ( "HTRFCR", "Hyp Trace Filter Control Register" ),
-        ( "p15", "c1", 0, "c2", 1 )   : ( "TRFCR", "Trace Filter Control Register" ),
-    }
-
-    def get_state(self, code_len):
-        d = {}
-
-        # pc
-        d["pc"] = current_arch.pc
-        if current_arch.is_thumb() and d["pc"] & 1:
-            d["pc"] -= 1
-
-        # code
-        d["code"] = read_memory(d["pc"], code_len)
-
-        # reg
-        d["reg"] = {}
-        for reg in current_arch.all_registers:
-            d["reg"][reg] = get_register(reg)
-        return d
-
-    def revert_state(self, d):
-        # code
-        write_memory(d["pc"], d["code"], len(d["code"]))
-
-        # reg
-        for reg, v in d["reg"].items():
-            if get_register(reg) == v:
-                continue
-            try:
-                gdb.execute("set {:s} = {:#x}".format(reg, v), to_string=True)
-            except Exception:
-                info("set {:s} = {:#x} is failed".format(reg, v))
-                pass
-        return
-
-    def close_stdout(self):
-        self.stdout = 1
-        self.stdout_bak = os.dup(self.stdout)
-        f = open("/dev/null")
-        os.dup2(f.fileno(), self.stdout)
-        f.close()
-        return
-
-    def revert_stdout(self):
-        os.dup2(self.stdout_bak, self.stdout)
-        os.close(self.stdout_bak)
-        return
-
-    def get_coproc_info(self, target_reg_name):
-       for k, v in self.AARCH32_COPROC_REGISTERS.items():
-           for reg_name, desc in slicer(v, 2):
-               if target_reg_name == reg_name:
-                   return k
-       return None
-
-    def get_mrc_code(self, cp_info):
-        code = "mrc {:s}, {:d}, r0, {:s}, {:s}, {:d}".format(cp_info[0], cp_info[2], cp_info[1], cp_info[3], cp_info[4])
-        arch, mode = get_keystone_arch()
-        raw_insns = keystone_assemble(code, arch, mode, raw=True)
-        return raw_insns
-
-    def mrc_execute(self, reg_name):
-        cp_info = self.get_coproc_info(reg_name)
-        if cp_info is None:
-            return None
-
-        if is_big_endian():
-            code = current_arch.infloop_insn[::-1] # to stop another thread
-            code += self.get_mrc_code(cp_info)[::-1]
-        else:
-            code = current_arch.infloop_insn # to stop another thread
-            code += self.get_mrc_code(cp_info)
-
-        # backup
-        gef_on_stop_unhook(hook_stop_handler)
-        d = self.get_state(len(code))
-
-        # modify code
-        write_memory(d["pc"], code, len(code))
-
-        # skip infloop
-        dst = d["pc"] + len(current_arch.infloop_insn)
-        gdb.execute("set $pc = {:#x}".format(dst), to_string=True)
-
-        # exec
-        self.close_stdout()
-        gdb.execute("stepi", to_string=True)
-        ret = get_register(current_arch.return_register)
-
-        # revert
-        self.revert_stdout()
-        self.revert_state(d)
-        gef_on_stop_hook(hook_stop_handler)
-        return ret
-
-    @parse_args
-    @only_if_gdb_running
-    @only_if_qemu_system
-    @only_if_specific_arch(arch=["ARM32"])
-    def do_invoke(self, args):
-        if current_arch is None:
-            err("current_arch is not set.")
-            return
-
-        reg_name = args.reg_name
-        if reg_name.startswith("$"):
-            reg_name = reg_name[1:].upper()
-
-        ret = self.mrc_execute(reg_name)
-        if ret is not None:
-            gef_print("{:s} = {:#x}".format(reg_name, ret))
         return
 
 
@@ -15185,7 +14433,7 @@ class RopperCommand(GenericCommand):
 
 @register_command
 class RpCommand(GenericCommand):
-    """Invoke rp++ (v2) command to search rop gadgets. (x64/x86 only)"""
+    """Invoke rp++ v1 command to search rop gadgets. (x64/x86 only)"""
     _cmdline_ = "rp"
     _category_ = "07-b. External Command - Exploit Development"
 
@@ -15206,10 +14454,11 @@ class RpCommand(GenericCommand):
 
     def __init__(self):
         super().__init__(complete=gdb.COMPLETE_FILENAME)
+        self.rp_version = 1
         return
 
     def exec_rp(self, ropN):
-        output_file = "rp{}_rop_{}.txt".format(ropN, os.path.basename(self.path))
+        output_file = "rp{}_rop{}_{}.txt".format(self.rp_version, ropN, os.path.basename(self.path))
         output_path = os.path.join(GEF_TEMP_DIR, output_file)
         cmd = f"{self.rp} --file='{self.path}' --rop={ropN} --unique > {output_path}"
         gef_print(titlify(cmd))
@@ -15251,11 +14500,22 @@ class RpCommand(GenericCommand):
         self.dont_repeat()
 
         # load rp path
-        try:
-            self.rp = which("rp-lin")
-        except FileNotFoundError as e:
-            err("{}".format(e))
-            return
+        if self.rp_version == 1:
+            try:
+                self.rp = which("rp-lin-x64")
+            except FileNotFoundError as e1:
+                try:
+                    self.rp = which("rp-lin-x86")
+                except FileNotFoundError as e2:
+                    err("{}".format(e1))
+                    err("{}".format(e2))
+                    return
+        elif self.rp_version == 2:
+            try:
+                self.rp = which("rp-lin-x64-v2")
+            except FileNotFoundError as e1:
+                err("{}".format(e1))
+                return
 
         base_address = 0
         if args.libc:
@@ -15301,6 +14561,33 @@ class RpCommand(GenericCommand):
 
 
 @register_command
+class Rp2Command(RpCommand):
+    """Invoke rp++ v2 command to search rop gadgets. (x64/x86 only)"""
+    _cmdline_ = "rp2"
+    _category_ = "07-b. External Command - Exploit Development"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--bin', action='store_true', help='apply rp++ to binary itself.')
+    group.add_argument('--libc', action='store_true', help='apply rp++ to libc.so searched from vmmap.')
+    group.add_argument('--file', help='apply rp++ to specified file.')
+    group.add_argument('--kernel', action='store_true', help='dump kernel, then apply vmlinux-to-elf and rp++.')
+    parser.add_argument('-f', '--filter', action='append', default=[], help='REGEXP filter.')
+    parser.add_argument('-r', '--rop', dest='rop_N', default=3, help='the max length of rop gadget. (default: %(default)s)')
+    parser.add_argument('--no-print', action='store_true', help="run rp, create a temporary file, but don't display it.")
+    _syntax_ = parser.format_help()
+
+    _example_ = "{:s} --bin -f 'pop r[abcd]x'\n".format(_cmdline_)
+    _example_ += "{:s} --libc -f '(xchg|mov) [re]sp, \\\\w+' -f 'ret'\n".format(_cmdline_)
+    _example_ += "{:s} --kernel # under qemu-system only".format(_cmdline_)
+
+    def __init__(self):
+        super().__init__()
+        self.rp_version = 2
+        return
+
+
+@register_command
 class AssembleCommand(GenericCommand):
     """Inline code assemble by keystone."""
     _cmdline_ = "asm"
@@ -15309,8 +14596,8 @@ class AssembleCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-a', dest='arch', help='specify the architecture. (default: current_arch.arch)')
     parser.add_argument('-m', dest='mode', help='specify the mode. (default: current_arch.mode)')
-    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian.')
-    parser.add_argument('-s', dest='as_shellcode', action='store_true', help='output like shellcode style.')
+    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian. (default: %(default)s)')
+    parser.add_argument('-s', dest='as_shellcode', action='store_true', help='output like shellcode style. (default: %(default)s)')
     parser.add_argument('-l', dest='overwrite_location', metavar='LOCATION', type=parse_address, help='write to memory address.')
     parser.add_argument("instruction", metavar='INSTRUCTION', nargs='+', help='the code you want to assemble')
     _syntax_ = parser.format_help()
@@ -15412,7 +14699,7 @@ class DisassembleCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-a', dest='arch', help='specify the architecture. (default: current_arch.arch)')
     parser.add_argument('-m', dest='mode', help='specify the mode. (default: current_arch.mode)')
-    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian.')
+    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian. (default: %(default)s)')
     parser.add_argument("hex_code", metavar='HEX_CODE', nargs='+', help='the hex code you want to disassemble')
     _syntax_ = parser.format_help()
 
@@ -15505,11 +14792,10 @@ class AsmListCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-a', dest='arch', help='specify the architecture. (default: current_arch.arch)')
     parser.add_argument('-m', dest='mode', help='specify the mode. (default: current_arch.mode)')
-    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian.')
-    parser.add_argument("-b", dest='nbyte', type=int, help='filter by the length of asm byte.')
+    parser.add_argument('-e', dest='big_endian', action='store_true', help='use big-endian. (default: %(default)s)')
+    parser.add_argument("-n", dest='nbyte', type=int, help='filter by the length of asm byte.')
     parser.add_argument("-f", dest='include', action='append', help='filter by specified string.')
     parser.add_argument("-v", dest='exclude', action='append', help='filter by specified string.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
     _syntax_ = parser.format_help()
 
     _example_ = '{:s} -a X86 -m 64\n'.format(_cmdline_)
@@ -15663,7 +14949,7 @@ class AsmListCommand(GenericCommand):
 
         if (args.arch, args.mode) == (None, None):
             if is_alive():
-                arch, mode = get_capstone_arch(arch=current_arch.arch, mode=current_arch.mode, endian=is_big_endian())
+                arch, mode = get_capstone_arch(arch=args.arch, mode=args.mode, endian=is_big_endian())
                 arch_mode_s = ":".join([current_arch.arch, current_arch.mode])
                 endian_s = "big" if is_big_endian() else "little"
             else:
@@ -15722,7 +15008,7 @@ class AsmListCommand(GenericCommand):
             # not filtered
             text += line + "\n"
 
-        gef_print(text.rstrip(), less=not args.no_pager)
+        gef_print(text.rstrip(), less=True)
         return
 
 
@@ -15926,9 +15212,9 @@ class ElfInfoCommand(GenericCommand):
     _category_ = "02-a. Process Information - General"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument('-e', dest='use_readelf', action='store_true', help='use readelf.')
+    parser.add_argument('-e', dest='use_readelf', action='store_true', help='use readelf. (default: %(default)s)')
     parser.add_argument('-r', dest='remote', action='store_true',
-                        help='parse remote binary if download feature is available.')
+                        help='parse remote binary if download feature is available. (default: %(default)s)')
     parser.add_argument('-f', dest='file', help='the file path you want to parse.')
     parser.add_argument('-a', dest='address', type=parse_address, help='the memory address you want to parse.')
     _syntax_ = parser.format_help()
@@ -16675,377 +15961,21 @@ class ChecksecCommand(GenericCommand):
         return
 
     def print_security_properties_qemu_system(self):
-        if is_x86():
-            if (get_register("$cs") & 0b11) == 3:
-                err("Run in kernel space.")
-                return
-        elif is_arm32():
-            if (get_register(current_arch.flag_register) & 0b11111) in [0b10000, 0b11010]:
-                err("Run in kernel space.")
-                return
-        elif is_arm64():
-            if ((get_register(current_arch.flag_register) >> 2) & 0b11) != 1:
-                err("Run in kernel space.")
-                return
-        else:
-            err("Unsupported")
+        if not is_x86():
             return
-
-        gef_print(titlify("Register settings"))
-
-        # Arch Specific
-        if is_x86():
-            res = gdb.execute("monitor info registers", to_string=True)
-            cr0 = int(re.search(r"CR0=(\S+)", res).group(1), 16)
-            cr4 = int(re.search(r"CR4=(\S+)", res).group(1), 16)
-
-            # WP
-            if (cr0 >> 16) & 1:
-                gef_print("{:<30s}: {:s}".format("Write Protection (CR0 bit 16)", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("Write Protection (CR0 bit 16)", Color.colorify("Disabled", "bold red")))
-
-            # PAE
-            if (cr4 >> 5) & 1:
-                gef_print("{:<30s}: {:s} (NX is supported)".format("PAE (CR4 bit 5)", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s} (NX is unsupported)".format("PAE (CR4 bit 5)", Color.colorify("Disabled", "bold red")))
-
-            # SMEP
-            if (cr4 >> 20) & 1:
-                gef_print("{:<30s}: {:s}".format("SMEP (CR4 bit 20)", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("SMEP (CR4 bit 20)", Color.colorify("Disabled", "bold red")))
-
-            # SMAP
-            if (cr4 >> 21) & 1:
-                gef_print("{:<30s}: {:s}".format("SMAP (CR4 bit 21)", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("SMAP (CR4 bit 21)", Color.colorify("Disabled", "bold red")))
-
-        elif is_arm32():
-            # PXN
-            ID_MMFR0 = get_register('$ID_MMFR0', use_mbed_exec=True)
-            ID_MMFR0_S = get_register('$ID_MMFR0_S')
-            if ID_MMFR0 is not None and (ID_MMFR0 >> 2) & 1:
-                gef_print("{:<30s}: {:s}".format("PXN", Color.colorify("Enabled", "bold green")))
-            elif ID_MMFR0_S is not None and (ID_MMFR0_S >> 2) & 1:
-                gef_print("{:<30s}: {:s}".format("PXN", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("PXN", Color.colorify("Disabled", "bold red")))
-
-            # PAN
-            gef_print("{:<30s}: {:s} (all ARMv7 is unsupported)".format("PAN", Color.colorify("Disabled", "bold red")))
-
-        elif is_arm64():
-            # PXN
-            gef_print("{:<30s}: {:s} (all ARMv8~ is supported)".format("PXN", Color.colorify("Enabled", "bold green")))
-
-            # PAN
-            ID_AA64MMFR1_EL1 = get_register('$ID_AA64MMFR1_EL1')
-            if ID_AA64MMFR1_EL1 is not None and ((ID_AA64MMFR1_EL1 >> 20) & 0b1111) != 0b0000:
-                gef_print("{:<30s}: {:s}".format("PAN", Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("PAN", Color.colorify("Disabled", "bold red")))
-
-        gef_print(titlify("Memory settings"))
-        kinfo = KernelbaseCommand.get_kernel_base()
-        if kinfo.kbase is None:
-            err("kbasel is not found (get_kernel_base is failed)")
-            return
-        _stext = get_ksymaddr("_stext")
-        if _stext is None:
-            err("_stext is not found (ksymaddr-remote is failed)")
-            return
-
-        # KASLR
-        r = gdb.execute("ksymaddr-remote --quiet kaslr_", to_string=True)
-        ret = KernelCmdlineCommand.kernel_cmdline()
-        cfg = "CONFIG_RANDOMIZE_BASE (KASLR)"
-        address_info = "kbase: {:#x}, _stext:{:#x}".format(kinfo.kbase, _stext)
-        if r:
-            if ret and "nokaslr" in ret[1]:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), address_info))
-            else:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), address_info))
-        else:
-            gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Unsupported", "bold red"), address_info))
-
-        # FGKASLR
-        swapgs_restore_regs_and_return_to_usermode = get_ksymaddr("swapgs_restore_regs_and_return_to_usermode")
-        commit_creds = get_ksymaddr("commit_creds")
-        ret = KernelCmdlineCommand.kernel_cmdline()
-        cfg = "CONFIG_FG_KASLR"
-        if swapgs_restore_regs_and_return_to_usermode:
-            # swapgs_restore_regs_and_return_to_usermode is in a fixed location.
-            # commit_creds are placed dynamically.
-            if swapgs_restore_regs_and_return_to_usermode < commit_creds:
-                if ret and "nofgkaslr" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                else:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unsupported", "bold red")))
-        else:
-            if commit_creds:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unsupported", "bold red")))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-
-        # KPTI
-        cfg = "CONFIG_PAGE_TABLE_ISOLATION"
-        if is_x86():
-            pti_init = get_ksymaddr("pti_init")
-            ret = KernelCmdlineCommand.kernel_cmdline()
-            if pti_init:
-                if ret and "nopti" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                elif ret and "pti=off" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                elif ret and "mitigations=off" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                elif ret and "pti=on" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold green")))
-                else:
-                    # here is kernel context
-                    lines = get_maps_by_pagewalk("pagewalk -q --simple -n").splitlines()
-                    for line in lines:
-                        if "USER" in line and "R-X" in line:
-                            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                            break
-                    else:
-                        gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unsupported", "bold red")))
-
-        elif is_arm32():
-            gef_print("{:<30s}: {:s} (ARMv7 is unsupported)".format(cfg, Color.colorify("Unsupported", "bold red")))
-
-        elif is_arm64():
-            pti_init = get_ksymaddr("pti_init")
-            ret = KernelCmdlineCommand.kernel_cmdline()
-            if pti_init:
-                if ret and "kpti=0" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                elif ret and "mitigations=off" in ret[1] and "nokaslr" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-                elif ret and "mitigations=off" in ret[1] and "nokaslr" not in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold green")))
-                elif ret and "kpti=1" in ret[1]:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold green")))
-                else:
-                    gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled (maybe)", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unsupported", "bold red")))
-
-        # RWX kernel page
-        cfg = "RWX kernel page"
-        for m in kinfo.maps:
-            if m[2] == "RWX":
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Found", "bold red")))
-                break
-        else:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Not found", "bold green")))
-
-        # Secure-world
-        if is_arm32() or is_arm64():
-            r = gdb.execute("monitor info mtree -f", to_string=True)
-            if "virt.secure-ram" in r:
-                gef_print("{:<30s}: {:s}".format("Secure-World", Color.colorify("Exist", "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format("Secure-World", Color.colorify("Not exist", "bold red")))
-
-        gef_print(titlify("Symbol"))
-
-        # CONFIG_KALLSYMS_ALL
-        modprobe_path = get_ksymaddr("modprobe_path")
-        cfg = "CONFIG_KALLSYMS_ALL"
-        if modprobe_path:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Enabled", "bold red")))
-        else:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold green")))
-
-        gef_print(titlify("Read-only"))
-
-        # CONFIG_STATIC_USERMODEHELPER
-        mp = KernelAddressHeuristicFinder.get_modprobe_path()
-        cfg = "CONFIG_STATIC_USERMODEHELPER"
-        if mp is None:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Not found", "bold gray")))
-        else:
-            for vaddr, size, perm in kinfo.maps:
-                if vaddr <= mp < vaddr + size:
-                    if not "W" in perm:
-                        gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), perm))
-                    else:
-                        gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), perm))
-                    break
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Not found maps", "bold gray")))
-
-        gef_print(titlify("Allocator"))
-
-        # SLUB/SLAB/SLOB
-        allocator = False
-        r = gdb.execute("ksymaddr-remote --quiet slub_", to_string=True)
-        if r:
-            gef_print("{:<30s}: {:s}".format("Allocator", Color.colorify("SLUB", "bold green")))
-            allocator = "SLUB"
-        else:
-            r = gdb.execute("ksymaddr-remote --quiet slab_prepare_cpu", to_string=True)
-            if r:
-                gef_print("{:<30s}: {:s}".format("Allocator", Color.colorify("SLAB", "bold green")))
-                allocator = "SLAB"
-            else:
-                gef_print("{:<30s}: {:s}".format("Allocator", Color.colorify("SLOB", "bold green")))
-                allocator = "SLOB"
-
-        # CONFIG_SLAB_FREELIST_HARDENED
-        if allocator == "SLUB":
-            ret = gdb.execute("slub-dump kmalloc-8 kmalloc-16 kmalloc-32 kmalloc-64", to_string=True)
-            r = re.search(r"offsetof\(kmem_cache, random\): (0x\S+)", ret)
-            cfg = "CONFIG_SLAB_FREELIST_HARDENED"
-            if "Corrupted" in ret:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-            elif r:
-                additional = "offset: {:s}".format(r.group(1))
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-
-        gef_print(titlify("Stack"))
-
-        # CONFIG_STACKPROTECTOR
-        ret = gdb.execute("ktask -n", to_string=True)
-        r = re.search(r"offsetof\(task_struct, stack_canary\): (0x\S+)", ret)
-        cfg = "CONFIG_STACKPROTECTOR"
-        if r:
-            additional = "offset: {:s}".format(r.group(1))
-            gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-        else:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Disabled", "bold red")))
-
-        gef_print(titlify("Dangerous system call"))
-
-        # unprivileged_userfaultfd
-        cfg = "unprivileged_userfaultfd"
-        r1 = gdb.execute("syscall-table-view -f userfaultfd -n -q", to_string=True)
-        if "invalid userfaultfd" in r1:
-            additional = "userfaultfd syscall is disabled"
-            gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("None", "bold green"), additional))
-        else:
-            sysctl_unprivileged_userfaultfd = KernelAddressHeuristicFinder.get_sysctl_unprivileged_userfaultfd()
-            if sysctl_unprivileged_userfaultfd is None:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-            else:
-                v = u32(read_memory(sysctl_unprivileged_userfaultfd, 4))
-                additional = "unprivileged_userfaultfd: {:d}".format(v)
-                if v == 0:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold green"), additional))
-                else:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold red"), additional))
-
-        # unprivileged_bpf_disabled
-        cfg = "unprivileged_bpf_disabled"
-        r1 = gdb.execute("syscall-table-view -f bpf -n -q", to_string=True)
-        if "invalid bpf" in r1:
-            additional = "bpf syscall is disabled"
-            gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("None", "bold green"), additional))
-        else:
-            sysctl_unprivileged_bpf_disabled = KernelAddressHeuristicFinder.get_sysctl_unprivileged_bpf_disabled()
-            if sysctl_unprivileged_bpf_disabled is None:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-            else:
-                v = u32(read_memory(sysctl_unprivileged_bpf_disabled, 4))
-                additional = "unprivileged_bpf_disabled: {:d}".format(v)
-                if v == 0:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-                else:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-
-        # kexec_load_disabled
-        cfg = "kexec_load_disabled"
-        r1 = gdb.execute("syscall-table-view -f kexec_load -n -q", to_string=True)
-        r2 = gdb.execute("syscall-table-view -f kexec_file_load -n -q", to_string=True)
-        if "invalid kexec_load" in r1 and "invalid kexec_file_load" in r2:
-            additional = "kexec_load, kexec_file_load syscalls are disabled"
-            gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("None", "bold green"), additional))
-        else:
-            kexec_load_disabled = KernelAddressHeuristicFinder.get_kexec_load_disabled()
-            if kexec_load_disabled is None:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-            else:
-                v1 = u32(read_memory(kexec_load_disabled, 4))
-                additional = "kexec_load_disabled: {:d}".format(v1)
-                if v1 == 0:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-                else:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-
-        gef_print(titlify("Other"))
-
-        # mmap_min_addr
-        mmap_min_addr = KernelAddressHeuristicFinder.get_mmap_min_addr()
-        cfg = "mmap_min_addr"
-        if mmap_min_addr is None:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-        else:
-            val = read_int_from_memory(mmap_min_addr)
-            if val:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("{:#x}".format(val), "bold green")))
-            else:
-                gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("{:#x}".format(val), "bold red")))
-
-        # KADR (kallsyms)
-        kptr_restrict = KernelAddressHeuristicFinder.get_kptr_restrict()
-        sysctl_perf_event_paranoid = KernelAddressHeuristicFinder.get_sysctl_perf_event_paranoid()
-        cfg = "KADR (kallsyms)"
-        if kptr_restrict is None:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-        else:
-            kversion = float(re.search(r"Linux version (\d\.\d+).\d+", gdb.execute("kversion", to_string=True)).group(1))
-            if kversion < 4.15:
-                v1 = u32(read_memory(kptr_restrict, 4))
-                additional = "kptr_restrict: {:d}".format(v1)
-                if v1 == 0:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-                else:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-            else:
-                v1 = u32(read_memory(kptr_restrict, 4))
-                v2 = u32(read_memory(sysctl_perf_event_paranoid, 4))
-                additional = "kptr_restrict: {:d}, perf_event_paranoid: {:d}".format(v1, v2)
-                if v1 == 0 and v2 == 0:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-                else:
-                    gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-
-        # KADR (dmesg)
-        dmesg_restrict = KernelAddressHeuristicFinder.get_dmesg_restrict()
-        cfg = "KADR (dmesg)"
-        if dmesg_restrict is None:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-        else:
-            v1 = u32(read_memory(dmesg_restrict, 4))
-            additional = "dmesg_restrict: {:d}".format(v1)
-            if v1 == 0:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-            else:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-
-        # ptrace_scope
-        ptrace_scope = KernelAddressHeuristicFinder.get_ptrace_scope()
-        cfg = "ptrace_scope"
-        if ptrace_scope is None:
-            gef_print("{:<30s}: {:s}".format(cfg, Color.colorify("Unknown", "bold gray")))
-        else:
-            v1 = u32(read_memory(ptrace_scope, 4))
-            additional = "ptrace_scope: {:d}".format(v1)
-            if v1 == 0:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold red"), additional))
-            else:
-                gef_print("{:<30s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
-
+        ret = gdb.execute("qreg -v", to_string=True)
+        flag = False
+        for line in ret.splitlines():
+            if "CR0 (Control Register 0)" in line:
+                flag = True
+            if "CR1 (Control Register 1)" in line:
+                flag = False
+            if "CR4 (Control Register 4)" in line:
+                flag = True
+            if "DR0-DR3 (Debug Address Register 0-3)" in line:
+                flag = False
+            if flag:
+                gef_print(line)
         return
 
 
@@ -19393,16 +18323,13 @@ class ContextCommand(GenericCommand):
         if not is_x86():
             return
 
-        inst_iter = gef_disassemble(current_arch.pc, 2)
+        inst_iter = gef_disassemble(current_arch.pc, 1)
         insn_here = inst_iter.__next__()
         if insn_here.operands == []:
             return
 
         insn = ','.join(insn_here.operands)
         insn = re.sub(r"<.+>", "", insn)
-
-        insn_next = inst_iter.__next__()
-        codesize = insn_next.address - insn_here.address
 
         r = re.findall(r"((fs|gs):\[?([^,\]]+)\]?)", str(insn))
         if r:
@@ -19415,8 +18342,6 @@ class ContextCommand(GenericCommand):
             offset = offset.split()
             offset = ["$" + x if x.isalpha() or re.match(r"r\d+d?", x) else x for x in offset]
             offset = ''.join(offset)
-            # $rip/$eip points next instruction
-            offset = offset.replace("$rip", f"$rip+{codesize:#x}")
             offset = parse_address(offset)
             mask = ((1 << 32) - 1) if is_32bit() else ((1 << 64) - 1)
             addr = (tls + offset) & mask
@@ -37183,7 +36108,7 @@ class KernelAddressHeuristicFinder:
 
     @staticmethod
     def get_saved_command_line():
-        # plan 1 (available v2.6.28-rc1 or later)
+        # plan 1
         cmdline_proc_show = get_ksymaddr("cmdline_proc_show")
         if cmdline_proc_show:
             res = gdb.execute("x/10i {:#x}".format(cmdline_proc_show), to_string=True)
@@ -37252,12 +36177,6 @@ class KernelAddressHeuristicFinder:
                             if v != 0:
                                 return v
         elif is_arm32():
-            # plan 1
-            r = get_register("$TPIDRURO")
-            if r and is_valid_addr(r):
-                return r
-
-            # plan 2
             current_thread_info = current_arch.sp & ~0x1fff
             v = read_int_from_memory(current_thread_info + current_arch.ptrsize * 3)
             return v
@@ -37272,94 +36191,52 @@ class KernelAddressHeuristicFinder:
         if init_task:
             return init_task
 
-        # plan 2 (available v3.4-rc1 or later)
-        do_exit = get_ksymaddr("do_exit")
-        if do_exit:
-            res = gdb.execute("x/600i {:#x}".format(do_exit), to_string=True)
+        # plan 2 (available v2.6.29.3 or later)
+        chroot_fs_refs = get_ksymaddr("chroot_fs_refs")
+        if chroot_fs_refs:
+            res = gdb.execute("x/30i {:#x}".format(chroot_fs_refs), to_string=True)
             if is_x86_64():
                 for line in res.splitlines():
-                    m = re.search(r"cmp\s+\S+,\s*(0x\w+)", line)
+                    m = re.search(r"QWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
                     if m:
                         v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v & 0x8000000000000000:
+                        if v != 0:
                             return v
             elif is_x86_32():
                 for line in res.splitlines():
-                    m = re.search(r"cmp\s+\S+,\s*(0x\w+)", line)
+                    m = re.search(r"ds:(0x\w+)", line)
                     if m:
                         v = int(m.group(1), 16) & 0xffffffff
-                        if v & 0x80000000:
+                        if v != 0:
                             return v
             elif is_arm64():
-                adrp = None
-                add = None
-                for i, line in enumerate(res.splitlines()):
-                    m = re.search(r"adrp\s+\S+,\s*(0x\S+)", line)
-                    if m:
-                        adrp = int(m.group(1), 16)
-                        adrp_idx = i
-                    m = re.search(r"add\s+\S+,\s*\S+,\s*#(0x\S+)", line)
-                    if m:
-                        add = int(m.group(1), 16)
-                        add_idx = i
-                    if adrp and add:
-                        if abs(adrp_idx - add_idx) > 2:
-                            if adrp_idx < add_idx:
-                                adrp = None
+                count = 0
+                base = None
+                for line in res.splitlines():
+                    if base is None:
+                        m = re.search(r"adrp\s+\S+,\s*(0x\S+)", line)
+                        if m:
+                            base = int(m.group(1), 16)
+                    else:
+                        m = re.search(r"add\s+\S+,\s*\S+,\s*#(0x\S+)", line)
+                        if m:
+                            addr = base + int(m.group(1), 16) # add 1 time
+                            if count == 1:
+                                return addr # 2nd pair of (adrp + add) is target
                             else:
-                                add = None
-                            continue
-                        candidate = adrp + add
-                        adrp = None
-                        add = None
-                        if not is_valid_addr(candidate):
-                            continue
-                        v1 = read_int_from_memory(candidate)
-                        v2 = read_int_from_memory(candidate + current_arch.ptrsize)
-                        if v1 == v2 and v1 != 0:
-                            continue
-                        if is_valid_addr(v1):
-                            continue
-                        if len(read_cstring_from_memory(candidate)) > 5:
-                            continue
-                        if read_memory(candidate, 0x20) == b"\0" * 0x20:
-                            continue
-                        return candidate
+                                base = None
+                                count += 1
             elif is_arm32():
-                movw = None
-                movt = None
-                for i, line in enumerate(res.splitlines()):
-                    m = re.search(r"movw.*;\s*(0x\S+)", line)
-                    if m:
-                        movw = int(m.group(1), 16)
-                        movw_idx = i
-                    m = re.search(r"movt.*;\s*(0x\S+)", line)
-                    if m:
-                        movt = int(m.group(1), 16)
-                        movt_idx = i
-                    if movw and movt:
-                        if abs(movw_idx - movt_idx) > 2:
-                            if movw_idx < movt_idx:
-                                movw = None
-                            else:
-                                movt = None
-                            continue
-                        candidate = (movt << 16) | movw
-                        movw = None
-                        movt = None
-                        if not is_valid_addr(candidate):
-                            continue
-                        v1 = read_int_from_memory(candidate)
-                        v2 = read_int_from_memory(candidate + current_arch.ptrsize)
-                        if v1 == v2 and v1 != 0:
-                            continue
-                        if is_valid_addr(v1):
-                            continue
-                        if len(read_cstring_from_memory(candidate)) > 5:
-                            continue
-                        if read_memory(candidate, 0x20) == b"\0" * 0x20:
-                            continue
-                        return candidate
+                base = None
+                for line in res.splitlines():
+                    if base is None:
+                        m = re.search(r"movw.*;\s*(0x\S+)", line)
+                        if m:
+                            base = int(m.group(1), 16)
+                    else:
+                        m = re.search(r"movt.*;\s*(0x\S+)", line)
+                        if m:
+                            return base + (int(m.group(1), 16) << 16)
         return None
 
     @staticmethod
@@ -37368,78 +36245,6 @@ class KernelAddressHeuristicFinder:
         init_cred = get_ksymaddr("init_cred")
         if init_cred:
             return init_cred
-
-        # plan 2
-        prepare_kernel_cred = get_ksymaddr("prepare_kernel_cred")
-        if prepare_kernel_cred:
-            res = gdb.execute("x/100i {:#x}".format(prepare_kernel_cred), to_string=True)
-            if is_x86_64():
-                for line in res.splitlines():
-                    m = re.search(r"WORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0 and is_valid_addr(v) and read_int_from_memory(v) == 4:
-                            return v
-            elif is_x86_32():
-                for line in res.splitlines():
-                    m = re.search(r"ds:(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0 and is_valid_addr(v) and read_int_from_memory(v) == 4:
-                            return v
-            elif is_arm64():
-                adrp = None
-                add = None
-                for i, line in enumerate(res.splitlines()):
-                    m = re.search(r"adrp\s+\S+,\s*(0x\S+)", line)
-                    if m:
-                        adrp = int(m.group(1), 16)
-                        adrp_idx = i
-                    m = re.search(r"add\s+\S+,\s*\S+,\s*#(0x\S+)", line)
-                    if m:
-                        add = int(m.group(1), 16)
-                        add_idx = i
-                    if adrp and add:
-                        if abs(adrp_idx - add_idx) > 2:
-                            if adrp_idx < add_idx:
-                                adrp = None
-                            else:
-                                add = None
-                            continue
-                        candidate = adrp + add
-                        adrp = None
-                        add = None
-                        if not is_valid_addr(candidate):
-                            continue
-                        if read_int_from_memory(candidate) == 4:
-                            return candidate
-            elif is_arm32():
-                movw = None
-                movt = None
-                for i, line in enumerate(res.splitlines()):
-                    m = re.search(r"movw.*;\s*(0x\S+)", line)
-                    if m:
-                        movw = int(m.group(1), 16)
-                        movw_idx = i
-                    m = re.search(r"movt.*;\s*(0x\S+)", line)
-                    if m:
-                        movt = int(m.group(1), 16)
-                        movt_idx = i
-                    if movw and movt:
-                        if abs(movw_idx - movt_idx) > 2:
-                            if movw_idx < movt_idx:
-                                movw = None
-                            else:
-                                movt = None
-                            continue
-                        candidate = (movt << 16) | movw
-                        movw = None
-                        movt = None
-                        if not is_valid_addr(candidate):
-                            continue
-                        if read_int_from_memory(candidate) == 4:
-                            return candidate
-        return None
 
     @staticmethod
     def get_modules():
@@ -37522,7 +36327,7 @@ class KernelAddressHeuristicFinder:
         if chrdevs:
             return chrdevs
 
-        # plan 2 (available v2.6.16.12 or later)
+        # plan 2
         chrdev_show = get_ksymaddr("chrdev_show")
         if chrdev_show:
             res = gdb.execute("x/30i {:#x}".format(chrdev_show), to_string=True)
@@ -37588,7 +36393,7 @@ class KernelAddressHeuristicFinder:
         if cdev_map:
             return cdev_map
 
-        # plan 2 (available v2.5.70 or later)
+        # plan 2
         cdev_del = get_ksymaddr("cdev_del")
         if cdev_del:
             res = gdb.execute("x/30i {:#x}".format(cdev_del), to_string=True)
@@ -37795,7 +36600,7 @@ class KernelAddressHeuristicFinder:
         if __per_cpu_offset:
             return __per_cpu_offset
 
-        # plan 2 (available v3.3-rc1 or later)
+        # plan 2
         nr_iowait_cpu = get_ksymaddr("nr_iowait_cpu")
         if nr_iowait_cpu:
             res = gdb.execute("x/10i {:#x}".format(nr_iowait_cpu), to_string=True)
@@ -37805,53 +36610,35 @@ class KernelAddressHeuristicFinder:
                     m = re.search(r"add.*QWORD PTR \[.*([-+]0x\S+)\]", line)
                     if m:
                         v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if is_valid_addr(v):
-                            cpu0 = read_int_from_memory(v)
-                            if cpu0 and (cpu0 & 0xfff) == 0:
-                                return v
+                        if v != 0:
+                            return v
                 # pattern 2
                 for line in res.splitlines():
                     m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
                     if m:
                         v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if is_valid_addr(v):
-                            cpu0 = read_int_from_memory(v)
-                            if cpu0 and (cpu0 & 0xfff) == 0:
-                                return v
+                        if v != 0:
+                            return v
             elif is_x86_32():
                 # pattern 1
                 for line in res.splitlines():
                     m = re.search(r"DWORD PTR \[.*([-+]0x\S+)\]", line)
                     if m:
                         v = int(m.group(1), 16) & 0xffffffff
-                        if is_valid_addr(v):
-                            cpu0 = read_int_from_memory(v)
-                            if cpu0 and (cpu0 & 0xfff) == 0:
-                                return v
+                        if v != 0:
+                            return v
             elif is_arm64():
-                # pattern 1
-                bases = {}
+                base = None
                 for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"add\s+(\S+),\s*(\S+),\s*#(0x\S+)", line)
-                    if m:
-                        dstreg = m.group(1)
-                        srcreg = m.group(2)
-                        add = int(m.group(3), 16)
-                        if srcreg in bases:
-                            v = bases[srcreg] + add
-                            if is_valid_addr(v):
-                                cpu0 = read_int_from_memory(v)
-                                if cpu0 and (cpu0 & 0xfff) == 0:
-                                    return v
-                            del bases[srcreg]
+                    if base is None:
+                        m = re.search(r"adrp\s+\S+,\s*(0x\S+)", line)
+                        if m:
+                            base = int(m.group(1), 16)
+                    else:
+                        m = re.search(r"add\s+\S+,\s*\S+,\s*#(0x\S+)", line)
+                        if m:
+                            return base + int(m.group(1), 16)
             elif is_arm32():
-                # pattern 1
                 base = None
                 for line in res.splitlines():
                     if base is None:
@@ -37861,11 +36648,7 @@ class KernelAddressHeuristicFinder:
                     else:
                         m = re.search(r"movt.*;\s*(0x\S+)", line)
                         if m:
-                            v = base + (int(m.group(1), 16) << 16)
-                            if is_valid_addr(v):
-                                cpu0 = read_int_from_memory(v)
-                                if cpu0 and (cpu0 & 0xfff) == 0:
-                                    return v
+                            return base + (int(m.group(1), 16) << 16)
         return None
 
     @staticmethod
@@ -37960,15 +36743,10 @@ class KernelAddressHeuristicFinder:
         if modprobe_path:
             return modprobe_path
 
-        # plan 2
-        modprobe = get_kparam("kernel.modprobe")
-        if modprobe:
-            return modprobe
-
-        # plan 3 (available v3.11-rc1 or later)
+        # plan 2 (available v3.11-rc1 or later)
         request_module = get_ksymaddr("__request_module")
         if request_module:
-            res = gdb.execute("x/40i {:#x}".format(request_module), to_string=True)
+            res = gdb.execute("x/30i {:#x}".format(request_module), to_string=True)
             if is_x86_64():
                 for line in res.splitlines():
                     m = re.search(r"BYTE PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
@@ -38018,12 +36796,7 @@ class KernelAddressHeuristicFinder:
         if poweroff_cmd:
             return poweroff_cmd
 
-        # plan 2
-        poweroff_cmd = get_kparam("kernel.poweroff_cmd")
-        if poweroff_cmd:
-            return poweroff_cmd
-
-        # plan 3 (available v4.1-rc1 or later)
+        # plan 2 (available v4.1-rc1 or later)
         poweroff_work_func = get_ksymaddr("poweroff_work_func")
         if poweroff_work_func:
             res = gdb.execute("x/20i {:#x}".format(poweroff_work_func), to_string=True)
@@ -38141,12 +36914,7 @@ class KernelAddressHeuristicFinder:
         if core_pattern:
             return core_pattern
 
-        # plan 2
-        core_pattern = get_kparam("kernel.core_pattern")
-        if core_pattern:
-            return core_pattern
-
-        # plan 3 (available v3.6-rc1 or later)
+        # plan 2 (available v3.6-rc1 or later)
         validate_coredump_safety = get_ksymaddr("validate_coredump_safety.part.0")
         if validate_coredump_safety:
             res = gdb.execute("x/10i {:#x}".format(validate_coredump_safety), to_string=True)
@@ -38342,72 +37110,13 @@ class KernelAddressHeuristicFinder:
         return None
 
     @staticmethod
-    def get_sysctl_table_root():
-        # plan 1 (directly)
-        sysctl_table_root = get_ksymaddr("sysctl_table_root")
-        if sysctl_table_root:
-            return sysctl_table_root
-
-        # plan 2
-        register_sysctl = get_ksymaddr("register_sysctl")
-        if register_sysctl:
-            res = gdb.execute("x/20i {:#x}".format(register_sysctl), to_string=True)
-            if is_x86_64():
-                for line in res.splitlines():
-                    m = re.search(r"mov\s+rdi\s*,\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0:
-                            return v
-            elif is_x86_32():
-                for line in res.splitlines():
-                    m = re.search(r"mov\s+e[a-d]x\s*,\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0:
-                            return v
-            elif is_arm64():
-                bases = {}
-                for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"add\s+(\S+),\s*(\S+),\s*#(0x\w+)", line)
-                    if m:
-                        srcreg = m.group(2)
-                        v = int(m.group(3), 16)
-                        if srcreg in bases:
-                            return bases[srcreg] + v
-                        continue
-            elif is_arm32():
-                base = None
-                for line in res.splitlines():
-                    if base is None:
-                        m = re.search(r"movw.*;\s*(0x\S+)", line)
-                        if m:
-                            base = int(m.group(1), 16)
-                    else:
-                        m = re.search(r"movt.*;\s*(0x\S+)", line)
-                        if m:
-                            return base + (int(m.group(1), 16) << 16)
-        return None
-
-    @staticmethod
     def get_mmap_min_addr():
         # plan 1 (directly)
         mmap_min_addr = get_ksymaddr("mmap_min_addr")
         if mmap_min_addr:
             return mmap_min_addr
 
-        # plan 2
-        mmap_min_addr = get_kparam("vm.mmap_min_addr")
-        if mmap_min_addr:
-            return mmap_min_addr
-
-        # plan 3 (available v4.19.27 or later)
+        # plan 2 (available v4.19.27 or later)
         expand_downwards = get_ksymaddr("expand_downwards")
         if expand_downwards:
             res = gdb.execute("x/20i {:#x}".format(expand_downwards), to_string=True)
@@ -38450,316 +37159,6 @@ class KernelAddressHeuristicFinder:
         return None
 
     @staticmethod
-    def get_sysctl_unprivileged_userfaultfd():
-        # plan 1 (directly)
-        sysctl_unprivileged_userfaultfd = get_ksymaddr("sysctl_unprivileged_userfaultfd")
-        if sysctl_unprivileged_userfaultfd:
-            return sysctl_unprivileged_userfaultfd
-
-        # plan 2
-        unprivileged_userfaultfd = get_kparam("vm.unprivileged_userfaultfd")
-        if unprivileged_userfaultfd:
-            return unprivileged_userfaultfd
-        return None
-
-    @staticmethod
-    def get_sysctl_unprivileged_bpf_disabled():
-        # plan 1 (directly)
-        sysctl_unprivileged_bpf_disabled = get_ksymaddr("sysctl_unprivileged_bpf_disabled")
-        if sysctl_unprivileged_bpf_disabled:
-            return sysctl_unprivileged_bpf_disabled
-
-        # plan 2
-        unprivileged_bpf_disabled = get_kparam("kernel.unprivileged_bpf_disabled")
-        if unprivileged_bpf_disabled:
-            return unprivileged_bpf_disabled
-
-        # plan 3 (available v4.9.91 ~ v5.18.19)
-        __do_sys_bpf = get_ksymaddr("__do_sys_bpf")
-        if __do_sys_bpf:
-            res = gdb.execute("x/20i {:#x}".format(__do_sys_bpf), to_string=True)
-            if is_x86_64():
-                for line in res.splitlines():
-                    m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0:
-                            return v
-            elif is_x86_32():
-                for line in res.splitlines():
-                    m = re.search(r"ds:(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0:
-                            return v
-            elif is_arm64():
-                bases = {}
-                for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"ldr\s+\S+,\s*\[(\S+),\s*#(\d+)\]", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 0)
-                        if reg in bases:
-                            return bases[reg] + v
-            elif is_arm32():
-                bases = {}
-                add1time = {}
-                for line in res.splitlines():
-                    m = re.search(r"movw\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"movt\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 16) << 16
-                        if reg in bases:
-                            return bases[reg] + v
-        return None
-
-    @staticmethod
-    def get_kptr_restrict():
-        # plan 1 (directly)
-        kptr_restrict = get_ksymaddr("kptr_restrict")
-        if kptr_restrict:
-            return kptr_restrict
-
-        # plan 2
-        kptr_restrict = get_kparam("kernel.kptr_restrict")
-        if kptr_restrict:
-            return kptr_restrict
-
-        # plan 3 (available v4.15-rc1 or later)
-        kallsyms_show_value = get_ksymaddr("kallsyms_show_value")
-        if kallsyms_show_value:
-            res = gdb.execute("x/20i {:#x}".format(kallsyms_show_value), to_string=True)
-            if is_x86_64():
-                for line in res.splitlines():
-                    m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0:
-                            return v
-            elif is_x86_32():
-                for line in res.splitlines():
-                    m = re.search(r"ds:(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0:
-                            return v
-            elif is_arm64():
-                bases = {}
-                for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"ldr\s+\S+,\s*\[(\S+),\s*#(\d+)\]", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 0)
-                        if reg in bases:
-                            return bases[reg] + v
-            elif is_arm32():
-                bases = {}
-                add1time = {}
-                for line in res.splitlines():
-                    m = re.search(r"movw\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"movt\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 16) << 16
-                        if reg in bases:
-                            return bases[reg] + v
-        return None
-
-    @staticmethod
-    def get_sysctl_perf_event_paranoid():
-        # plan 1 (directly)
-        sysctl_perf_event_paranoid = get_ksymaddr("sysctl_perf_event_paranoid")
-        if sysctl_perf_event_paranoid:
-            return sysctl_perf_event_paranoid
-
-        # plan 2
-        perf_event_paranoid = get_kparam("kernel.perf_event_paranoid")
-        if perf_event_paranoid:
-            return perf_event_paranoid
-
-        # plan 3 (available v4.15-rc1 or later)
-        kallsyms_show_value = get_ksymaddr("kallsyms_show_value")
-        if kallsyms_show_value:
-            res = gdb.execute("x/20i {:#x}".format(kallsyms_show_value), to_string=True)
-            if is_x86_64():
-                count = 0
-                for line in res.splitlines():
-                    m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0:
-                            count += 1
-                            if count == 2:
-                                return v
-            elif is_x86_32():
-                count = 0
-                for line in res.splitlines():
-                    m = re.search(r"ds:(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0:
-                            count += 1
-                            if count == 2:
-                                return v
-            elif is_arm64():
-                count = 0
-                bases = {}
-                for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"ldr\s+\S+,\s*\[(\S+),\s*#(\d+)\]", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 0)
-                        if reg in bases:
-                            count += 1
-                            if count == 2:
-                                return bases[reg] + v
-            elif is_arm32():
-                count = 0
-                bases = {}
-                add1time = {}
-                for line in res.splitlines():
-                    m = re.search(r"movw\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"movt\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 16) << 16
-                        if reg in bases:
-                            count += 1
-                            if count == 2:
-                                return bases[reg] + v
-        return None
-
-    @staticmethod
-    def get_dmesg_restrict():
-        # plan 1 (directly)
-        get_dmesg_restrict = get_ksymaddr("dmesg_restrict")
-        if get_dmesg_restrict:
-            return get_dmesg_restrict
-
-        # plan 2
-        dmesg_restrict = get_kparam("kernel.dmesg_restrict")
-        if dmesg_restrict:
-            return dmesg_restrict
-
-        # plan 3 (available v3.11-rc4 or later)
-        check_syslog_permissions = get_ksymaddr("check_syslog_permissions")
-        if check_syslog_permissions:
-            res = gdb.execute("x/20i {:#x}".format(check_syslog_permissions), to_string=True)
-            if is_x86_64():
-                for line in res.splitlines():
-                    m = re.search(r"DWORD PTR \[rip\+0x\w+\].*#\s*(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffffffffffff
-                        if v != 0:
-                            return v
-            elif is_x86_32():
-                for line in res.splitlines():
-                    m = re.search(r"ds:(0x\w+)", line)
-                    if m:
-                        v = int(m.group(1), 16) & 0xffffffff
-                        if v != 0:
-                            return v
-            elif is_arm64():
-                bases = {}
-                for line in res.splitlines():
-                    m = re.search(r"adrp\s+(\S+),\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"ldr\s+\S+,\s*\[(\S+),\s*#(\d+)\]", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 0)
-                        if reg in bases:
-                            return bases[reg] + v
-            elif is_arm32():
-                bases = {}
-                add1time = {}
-                for line in res.splitlines():
-                    m = re.search(r"movw\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        base = int(m.group(2), 16)
-                        bases[reg] = base
-                        continue
-                    m = re.search(r"movt\s+(\S+),.+;\s*(0x\S+)", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 16) << 16
-                        if reg in bases:
-                            add1time[reg] = bases[reg] + v
-                            continue
-                    m = re.search(r"ldr\s+\S+,\s*\[(\S+),\s*#(\d+)\]", line)
-                    if m:
-                        reg = m.group(1)
-                        v = int(m.group(2), 0)
-                        if reg in add1time:
-                            return add1time[reg] + v
-        return None
-
-    @staticmethod
-    def get_kexec_load_disabled():
-        # plan 1 (directly)
-        kexec_load_disabled = get_ksymaddr("kexec_load_disabled")
-        if kexec_load_disabled:
-            return kexec_load_disabled
-
-        # plan 2
-        kexec_load_disabled = get_kparam("kernel.kexec_load_disabled")
-        if kexec_load_disabled:
-            return kexec_load_disabled
-        return None
-
-    @staticmethod
-    def get_ptrace_scope():
-        # plan 1 (directly)
-        ptrace_scope = get_ksymaddr("ptrace_scope")
-        if ptrace_scope:
-            return ptrace_scope
-
-        # plan 2
-        ptrace_scope = get_kparam("kernel.ptrace_scope")
-        if ptrace_scope:
-            return ptrace_scope
-        return None
-
-    @staticmethod
     def get_vdso_info():
         # plan 1 (directly)
         vdso_info = get_ksymaddr("vdso_info")
@@ -38797,7 +37196,7 @@ class KernelbaseCommand(GenericCommand):
     @functools.lru_cache(maxsize=None)
     def get_maps():
         maps = []
-        res = get_maps_by_pagewalk("pagewalk -q --simple -n")
+        res = get_maps_by_pagewalk("pagewalk -q --simple")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -38983,6 +37382,7 @@ class KernelVersionCommand(GenericCommand):
     def kernel_version(self):
         info("Wait for memory scan")
         kinfo = KernelbaseCommand.get_kernel_base()
+        print(kinfo)
         if kinfo.has_none:
             err("Failed to resolve")
             return None
@@ -39037,8 +37437,7 @@ class KernelCmdlineCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
 
-    @staticmethod
-    def kernel_cmdline():
+    def kernel_cmdline(self):
         saved_command_line = KernelAddressHeuristicFinder.get_saved_command_line()
         if saved_command_line is None:
             return None
@@ -39057,7 +37456,7 @@ class KernelCmdlineCommand(GenericCommand):
 
         info("Wait for memory scan")
 
-        ret = KernelCmdlineCommand.kernel_cmdline()
+        ret = self.kernel_cmdline()
         if ret is None:
             err("Parse failed")
             return
@@ -39123,7 +37522,6 @@ class KernelCurrentCommand(GenericCommand):
             if (current_task & mask) == mask:
                 task = read_int_from_memory(current_task)
                 if is_valid_addr(task):
-                    info("__per_cpu_offset is not used")
                     gef_print(titlify("Kernel current task_struct (heuristic)"))
                     gef_print("current: {:#x}".format(task))
                     return
@@ -39145,7 +37543,7 @@ class KernelTaskCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-f', '--filter', action='append', default=[], help='REGEXP filter.')
-    parser.add_argument('-m', '--print-maps', action='store_true', help='print memory map each process.')
+    parser.add_argument('-m', dest='mm', action='store_true', help='print memory map each process.')
     parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
     _syntax_ = parser.format_help()
 
@@ -39262,110 +37660,6 @@ class KernelTaskCommand(GenericCommand):
                     return offset_cred
         err("Not found task->cred")
         return None
-
-    def get_offset_stack(self, task_addrs):
-        """
-        #ifdef CONFIG_THREAD_INFO_IN_TASK
-            struct thread_info  thread_info;
-        #endif
-            volatile long       state;
-            void                *stack;
-        """
-        for i in range(0x100):
-            found = False
-            for task in task_addrs:
-                v = read_int_from_memory(task + current_arch.ptrsize * i)
-                if (v & 0x1fff) != 0:
-                    break
-                if not is_valid_addr(v):
-                    break
-            else:
-                found = True
-
-            if found is False:
-                continue
-
-            offset_stack = current_arch.ptrsize * i
-            info("offsetof(task_struct, stack): {:#x}".format(offset_stack))
-            return offset_stack
-
-        err("Not found task->stack")
-        return None
-
-    def get_offset_pid(self, task_addrs):
-        """
-            pid_t               pid;
-            pid_t               tgid;
-
-        0xc6d1e888:     0xc6d1f048      0xc6d1c1c8      0x0000008c      0xc6d1e894
-        0xc6d1e898:     0xc6d1e894      0xc6d1e89c      0xc6d1e89c      0xc6d1e8a4
-        0xc6d1e8a8:     0x00000000      0x00000000      0xc7830660      0xc7830660
-        0xc6d1e8b8:     0x00000008      0x00000000      0xc6d51300      0x00000000
-        0xc6d1e8c8:     0x00000000      0xc6d514e0      0x00000017      0x000000a9
-        0xc6d1e8d8:     0x00000005      0x00000000      0x00000000      0x00000000
-        0xc6d1e8e8:     0x00000000      0x00000011      0x00000000      0x00000000
-        0xc6d1e8f8:     0x00000000      0x00000000      0x00000000      0x00000000
-        0xc6d1e908:     0xc245a8d0      0x00000000      0x00000000      0x00000000
-        0xc6d1e918:     0x00000000      0x00000000      0x00000000      0x00000000
-        0xc6d1e928:     0x00000031*     0x00000031      0xc7834000      0xc7834000
-        """
-        pid_max = 0x400000 if is_64bit() else 0x8000
-        for i in range(0x400):
-            found = False
-            seen_pid = set()
-            for task in task_addrs[1:]: # swapper/0 has pid 0. Don't use it as it will cause false positives.
-                v1 = u32(read_memory(task + (i + 0) * 4, 4))
-                v2 = u32(read_memory(task + (i + 1) * 4, 4))
-                if v1 == 0 or pid_max < v1: # pid is 1 ~ pid_max
-                    break
-                if v2 == 0 or pid_max < v2: # tgid is 1 ~ pid_max
-                    break
-                if v1 in seen_pid:
-                    break
-                seen_pid.add(v1)
-            else:
-                found = True
-
-            if found is False:
-                continue
-
-            offset_pid = i * 4
-            info("offsetof(task_struct, pid): {:#x}".format(offset_pid))
-            return offset_pid
-
-        err("Not found task->pid")
-        return None
-
-    def get_offset_canary(self, task_addrs, offset_pid):
-        """
-            pid_t               pid;
-            pid_t               tgid;
-        #ifdef CONFIG_STACKPROTECTOR
-            unsigned long       stack_canary;
-        #endif
-            struct task_struct __rcu    *real_parent;
-            struct task_struct __rcu    *parent;
-        """
-        offset_stack_canary = offset_pid + 4 + 4
-        found = True
-        for task in task_addrs:
-            v1 = read_int_from_memory(task + offset_stack_canary)
-            v2 = read_int_from_memory(task + offset_stack_canary + current_arch.ptrsize)
-
-            if v1 == v2: # stack canary != real_parent
-                found = False
-                break
-
-            if is_64bit() and (v1 & 0xff) != 0: # 32-bit canary does not have 0xXXXXXX00
-                found = False
-                break
-
-        if found:
-            info("offsetof(task_struct, stack_canary): {:#x}".format(offset_stack_canary))
-            return offset_stack_canary
-        else:
-            info("offsetof(task_struct, stack_canary): None")
-            return None
 
     def get_offset_uid(self, init_task_cred_ptr):
         """
@@ -39588,25 +37882,14 @@ class KernelTaskCommand(GenericCommand):
         if task_addrs is None:
             return
 
-        if args.print_maps:
-            offset_mm = self.get_offset_mm(task_addrs[0], offset_task)
-            if offset_mm is None:
-                return
-            # for get_mm and reuse
+        if args.mm:
             self.offset_vm_flags = None
             self.offset_vm_file = None
             self.offset_d_iname = None
             self.offset_d_parent = None
-
-        offset_stack = self.get_offset_stack(task_addrs)
-        if offset_stack is None:
-            return
-
-        offset_pid = self.get_offset_pid(task_addrs)
-        if offset_pid is None:
-            return
-
-        offset_kcanary = self.get_offset_canary(task_addrs, offset_pid)
+            offset_mm = self.get_offset_mm(task_addrs[0], offset_task)
+            if offset_mm is None:
+                return
 
         offset_comm = self.get_offset_comm(task_addrs)
         if offset_comm is None:
@@ -39622,33 +37905,26 @@ class KernelTaskCommand(GenericCommand):
 
         out = []
         ids_str = ["uid", "gid", "suid", "sgid", "euid", "egid", "fsuid", "fsgid"]
-        fmt = "{:<18s}: {:<7s} {:<16s} {:<18s} [{:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s}] {:<10s} {:<18s} {:<18s}"
-        legend = ["task", "pid", "task->comm", "task->cred", *ids_str, "securebits", "kstack", "kcanary"]
+        fmt = "{:<18s}: {:<16s} {:<18s} [{:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s} {:>5s}] {:<10s}"
+        legend = ["task", "task->comm", "task->cred", *ids_str, "securebits"]
         out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
         for task in task_addrs:
             comm_string = read_cstring_from_memory(task + offset_comm)
             if args.filter:
                 if not any([re.search(f, comm_string) for f in args.filter]):
                     continue
-            kstack = read_int_from_memory(task + offset_stack)
-            pid = u32(read_memory(task + offset_pid, 4))
             cred = read_int_from_memory(task + offset_cred)
             uids = [u32(read_memory(cred + offset_uid + j * 4, 4)) for j in range(8)]
             securebits = u32(read_memory(cred + offset_uid + 32, 4))
-            fmt = "{:#018x}: {:<7d} {:<16s} {:#018x} [{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d}] {:#10x} {:#018x} {:<18s}"
-            if offset_kcanary:
-                kcanary = read_int_from_memory(task + offset_kcanary)
-                kcanary = "{:#018x}".format(kcanary)
-            else:
-                kcanary = "None"
-            out.append(fmt.format(task, pid, comm_string, cred, *uids, securebits, kstack, kcanary))
+            fmt = "{:#018x}: {:<16s} {:#018x} [{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d},{:>5d}] {:#10x}"
+            out.append(fmt.format(task, comm_string, cred, *uids, securebits))
 
-            if args.print_maps:
+            if args.mm:
                 mms = self.get_mm(task, offset_mm)
                 if mms:
                     out.append(titlify("memory map of `{:s}`".format(comm_string)))
                 for mm in mms:
-                    out.append("{:#018x}-{:#018x} {:s} {:s}".format(mm.start, mm.end, mm.flags, mm.file))
+                    out.append("  {:#018x}-{:#018x} {:s} {:s}".format(mm.start, mm.end, mm.flags, mm.file))
                 if mms:
                     out.append(titlify(""))
         gef_print('\n'.join(out), less=not args.no_pager)
@@ -39849,7 +38125,7 @@ class KernelModuleCommand(GenericCommand):
         for module in module_addrs:
             name_string = read_cstring_from_memory(module + offset_name)
             base = read_int_from_memory(module + offset_layout)
-            size = u32(read_memory(module + offset_layout + current_arch.ptrsize, 4))
+            size = u32(read_memory(module + offset_layout + 4, 4))
             gef_print("{:#018x}: {:<18s} {:#018x} {:#018x}".format(module, name_string, base, size))
         return
 
@@ -40148,235 +38424,19 @@ class KernelFopsCommand(GenericCommand):
                 err("Memory read error")
                 return
 
-            fmt = "{:5s} {:<10s} {:<20s} {:s}"
-            legend = ["Index", "Type", "Name", "Value"]
+            fmt = "[{:3s}] {:<10s} {:<20s} {:s}"
+            legend = ["idx", "type", "name", "value"]
             gef_print(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
             for idx, ((type, name), address) in enumerate(zip(members, addrs)):
                 sym = get_symbol_string(address)
-                gef_print("[{:03d}] {:10s} {:20s} {:#018x}{:s}".format(idx, type, name, address, sym))
+                gef_print("[{:3d}] {:10s} {:20s} {:#018x}{:s}".format(idx, type, name, address, sym))
 
         else:
-            fmt = "{:5s} {:<10s} {:<20s}"
-            legend = ["Idx", "Type", "Name"]
+            fmt = "[{:3s}] {:<10s} {:<20s}"
+            legend = ["idx", "type", "name"]
             gef_print(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
             for idx, (type, name) in enumerate(members):
-                gef_print("[{:03d}] {:10s} {:20s}".format(idx, type, name))
-        return
-
-
-@register_command
-class KernelParamSysctlCommand(GenericCommand):
-    """Dump sysctl parameters using kenrel memory scanning."""
-    _cmdline_ = "kparam-sysctl"
-    _category_ = "08-b. Qemu-system Cooperation - Linux"
-
-    parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument('-f', '--filter', action='append', default=[], help='REGEXP filter.')
-    parser.add_argument('-q', '--quiet', action='store_true', help='enable quiet mode.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
-    parser.add_argument('-v', '--verbose', action='store_true', help='enable verbose mode.')
-    parser.add_argument('--exact', action='store_true', help='use exact match.')
-    _syntax_ = parser.format_help()
-
-    def __init__(self):
-        super().__init__()
-        self.initialized = False
-        return
-
-    def should_be_print(self, procname):
-        if self.filter == []:
-            return True
-
-        if self.exact:
-            for filt in self.filter:
-                if filt == procname:
-                    return True
-            return False
-
-        else:
-            for filt in self.filter:
-                if re.search(filt, procname):
-                    return True
-            return False
-
-    def sysctl_dump(self, rb_node):
-        right = read_int_from_memory(rb_node + current_arch.ptrsize * 1) & ~1 # remove RB_BLACK
-        left = read_int_from_memory(rb_node + current_arch.ptrsize * 2) & ~1 # remove RB_BLACK
-        ctl_dir = read_int_from_memory(rb_node + current_arch.ptrsize * 3)
-
-        if ctl_dir not in self.seen_ctl_dir:
-            self.seen_ctl_dir.append(ctl_dir)
-
-            # parent
-            parent = read_int_from_memory(ctl_dir + self.OFFSET_parent)
-            parent_path = self.parent_paths.get(parent, "")
-
-            # ctl_table(s)
-            ctl_table = read_int_from_memory(ctl_dir)
-            while True:
-                # procname
-                procname = read_int_from_memory(ctl_table)
-                if procname == 0:
-                    break
-                procname_str = read_cstring_from_memory(procname)
-                param_path = (parent_path + "." + procname_str).lstrip(".")
-                self.parent_paths[ctl_dir] = param_path
-
-                if self.should_be_print(param_path):
-                    # mode
-                    mode = u32(read_memory(ctl_table + self.OFFSET_mode, 4))
-
-                    if (mode & 0o0040000) == 0: # not directory
-                        # data
-                        data_addr = read_int_from_memory(ctl_table + current_arch.ptrsize)
-                        if data_addr and is_valid_addr(data_addr):
-                            # type from handler
-                            handler = read_int_from_memory(ctl_table + self.OFFSET_handler)
-                            # data length
-                            maxlen = u32(read_memory(ctl_table + self.OFFSET_maxlen, 4))
-
-                            if handler in self.str_types:
-                                data_val = read_cstring_from_memory(data_addr)
-                                fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:s}"
-                                self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                            elif maxlen == 4:
-                                data_val = u32(read_memory(data_addr, 4))
-                                fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:#018x}"
-                                self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                            elif maxlen == 8:
-                                data_val = u64(read_memory(data_addr, 8))
-                                fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:#018x}"
-                                self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                            elif maxlen == 1:
-                                data_val = u8(read_memory(data_addr, 1))
-                                fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:#018x}"
-                                self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                            elif maxlen == 0:
-                                if self.verbose:
-                                    fmt = "{:<55s}: {:#018x} {:#06x} {:#010o}"
-                                    self.out.append(fmt.format(param_path, data_addr, maxlen, mode))
-                            else:
-                                # type from heuristic
-                                data_val = read_cstring_from_memory(data_addr)
-                                if data_val and data_val.isprintable() and len(data_val) >= 2:
-                                    fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:s}"
-                                    self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                                else:
-                                    data_val = read_int_from_memory(data_addr)
-                                    fmt = "{:<55s}: {:#018x} {:#06x} {:#010o} {:#018x}"
-                                    self.out.append(fmt.format(param_path, data_addr, maxlen, mode, data_val))
-                        else:
-                            if self.verbose:
-                                fmt = "{:<55s}: {:#018x} {:#05x} {:#010o}"
-                                self.out.append(fmt.format(param_path, data_addr, maxlen, mode))
-
-                # goto next
-                ctl_table += self.SIZEOF_ctl_table
-
-            rb_node = read_int_from_memory(ctl_dir + self.OFFSET_rb_node) & ~1 # remove RB_BLACK
-            if rb_node:
-                self.sysctl_dump(rb_node)
-
-        if right:
-            self.sysctl_dump(right)
-        if left:
-            self.sysctl_dump(left)
-        return
-
-    def initialize(self):
-        if self.initialized:
-            return
-
-        if is_64bit():
-            # struct ctl_dir
-            self.OFFSET_rb_node = 0x50
-            self.OFFSET_parent = 0x38
-            # struct ctl_table
-            self.OFFSET_maxlen = 0x10
-            self.OFFSET_mode = 0x14
-            self.OFFSET_handler = 0x20
-            self.SIZEOF_ctl_table = 0x40
-        else:
-            # struct ctl_dir
-            self.OFFSET_rb_node = 0x2c
-            self.OFFSET_parent = 0x20
-            # struct ctl_table
-            self.OFFSET_maxlen = 0x8
-            self.OFFSET_mode = 0xc
-            self.OFFSET_handler = 0x14
-            self.SIZEOF_ctl_table = 0x24
-
-        known_str_types_handlers = [
-            "addrconf_sysctl_stable_secret",
-            "cdrom_sysctl_info",
-            "devkmsg_sysctl_set_loglvl",
-            "numa_zonelist_order_handler",
-            "proc_allowed_congestion_control",
-            "proc_do_large_bitmap",
-            "proc_do_uts_string",
-            "proc_dostring",
-            "proc_dostring_coredump",
-            "proc_tcp_available_congestion_control",
-            "proc_tcp_available_ulp",
-            "seccomp_actions_logged_handler",
-            "set_default_qdisc",
-        ]
-        self.str_types = []
-        for handler in known_str_types_handlers:
-            handler_addr = get_ksymaddr(handler)
-            if handler_addr:
-                self.str_types.append(handler_addr)
-
-        self.initialized = True
-        return
-
-    @parse_args
-    @only_if_gdb_running
-    @only_if_qemu_system
-    def do_invoke(self, args):
-        self.dont_repeat()
-
-        self.filter = args.filter
-        self.exact = args.exact
-        self.verbose = args.verbose
-
-        if not args.quiet:
-            info("Wait for memory scan")
-
-        sysctl_table_root = KernelAddressHeuristicFinder.get_sysctl_table_root()
-        if sysctl_table_root is None:
-            if not args.quiet:
-                err("Not found sysctl_table_root")
-            return
-
-        self.out = []
-        if not args.quiet:
-            fmt = "{:<55s}: {:<18s} {:<6s} {:<10s} {:<18s}"
-            legend = ["ParamName", "ParamAddress", "MaxLen", "Mode", "ParamValue"]
-            self.out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
-
-        self.initialize()
-
-        root_ctl_dir = sysctl_table_root + current_arch.ptrsize
-        root_rb_node = read_int_from_memory(root_ctl_dir + self.OFFSET_rb_node)
-
-        # fix for old kernel
-        if not is_valid_addr(root_rb_node):
-            # ctl_dir.header.inodes does not exist
-            self.OFFSET_rb_node -= current_arch.ptrsize
-            root_rb_node = read_int_from_memory(root_ctl_dir + self.OFFSET_rb_node)
-
-        self.seen_ctl_dir = []
-        self.parent_paths = {root_ctl_dir: ""}
-        try:
-            self.sysctl_dump(root_rb_node)
-        except gdb.MemoryError:
-            if not args.quiet:
-                err("Memory error")
-            return
-
-        if self.out:
-            gef_print('\n'.join(self.out), less=not args.no_pager)
+                gef_print("[{:3d}] {:10s} {:20s}".format(idx, type, name))
         return
 
 
@@ -40394,18 +38454,12 @@ class AsciiSearchCommand(GenericCommand):
     parser.add_argument('-r', '--range', default=0x40, type=lambda x: int(x, 16), help='search range. (default: %(default)s)')
     _syntax_ = parser.format_help()
 
-    seen = set()
-
     def search_ascii(self, locations, search_range, depth, max_depth):
         if depth == 0:
             return
-
-        old_locations = []
-        offset = 0
-        while offset < search_range:
+        for offset in range(0, search_range, current_arch.ptrsize):
             target = locations[-1] + offset
             if not is_valid_addr(target):
-                offset += current_arch.ptrsize
                 continue
 
             cstr = None
@@ -40416,21 +38470,12 @@ class AsciiSearchCommand(GenericCommand):
 
             if cstr:
                 if not self.filter or any([re.search(filt, cstr) for filt in self.filter]):
-                    if target not in self.seen:
-                        for d, loc in enumerate(locations):
-                            if old_locations != locations:
-                                gef_print("{:s}{:#x}".format("  " * d, loc))
-                        old_locations = locations.copy()
-                        gef_print("{:s}{:#x}: {:s}".format("  " * (d + 1), target, repr(cstr)))
-                        self.seen.add(target)
-                offset += len(cstr) + 1
-                continue
-
+                    for d, loc in enumerate(locations):
+                        gef_print("{:s}{:#x}".format("  " * d, loc))
+                    gef_print("{:s}{:#x}: {:s}".format("  " * (d + 1), target, repr(cstr)))
             v = read_int_from_memory(target)
             if is_valid_addr(v):
                 self.search_ascii(locations + [v], search_range, depth - 1, max_depth)
-
-            offset += current_arch.ptrsize
         return
 
     @parse_args
@@ -40450,95 +38495,52 @@ class SyscallTableViewCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-f', '--filter', action='append', default=[], help='REGEXP filter.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
-    parser.add_argument('-q', '--quiet', action='store_true', help='enable quiet mode.')
     _syntax_ = parser.format_help()
 
     _example_ = "{:s}\n".format(_cmdline_)
     _example_ += "{:s} --filter write".format(_cmdline_)
 
-    def __init__(self):
-        super().__init__()
-        self.cached_table = {}
-        return
-
-    def syscall_table_view(self, tag, sys_call_table_addr, syscall_list, nr_base=0):
+    def syscall_table_view(self, sys_call_table_addr):
         if sys_call_table_addr is None:
-            if not self.quiet:
-                self.out.append("{} {}".format(Color.colorify("[+]", "bold red"), "Not found symbol"))
+            err("Not found symbol")
             return
-
-        if safe_parse_and_eval("_stext"):
-            tag = "symboled" + tag
-
-        if tag not in self.cached_table:
-            # scan
-            self.cached_table[tag] = []
-            i = 0
-            while True:
-                addr = sys_call_table_addr + i * current_arch.ptrsize
-                try:
-                    syscall_function_addr = read_int_from_memory(addr)
-                except gdb.MemoryError:
-                    break
-                if is_x86() and syscall_function_addr % 0x10: # should be aligned
-                    break
-                elif (is_arm32() or is_arm64()) and syscall_function_addr % 4: # should be aligned
-                    break
-                try:
-                    read_int_from_memory(syscall_function_addr) # if entry is valid, no error
-                except gdb.MemoryError:
-                    break
-
-                # check if valid syscall
-                is_valid = True
-                insn = get_insn(syscall_function_addr)
-                insn2 = get_insn_next(syscall_function_addr)
-                if insn is None or insn2 is None:
-                    break
-                if is_x86_64():
-                    if len(insn.operands) == 2 and insn.operands[-1] == '0xffffffffffffffda' and \
-                       len(insn2.operands) == 0 and insn2.mnemonic == 'ret':
-                        is_valid = False
-                elif is_x86_32():
-                    if len(insn.operands) == 2 and insn.operands[-1] == '0xffffffda' and \
-                       len(insn2.operands) == 0 and insn2.mnemonic == 'ret':
-                        is_valid = False
-                symbol = get_symbol_string(syscall_function_addr, nosymbol_string=" <NO_SYMBOL>")
-                self.cached_table[tag].append([i, addr, syscall_function_addr, symbol, is_valid])
-                i += 1
-
-        # print legend
-        if not self.quiet:
-            fmt = "{:5s} {:<7s} {:<30s} {:18s}: {:18s} {:s}"
-            legend = ["Index", "IsValid", "Syscall Name", "Table Address", "Function Address", "Symbol"]
-            self.out.append(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
-
-        # for duplication check
-        seen_count = {}
-        for _, _, syscall_function_addr, _, _ in self.cached_table[tag]:
-            seen_count[syscall_function_addr] = seen_count.get(syscall_function_addr, 0) + 1
-
+        # scan
+        i = 0
+        seen = {}
+        table = []
+        while True:
+            addr = sys_call_table_addr + i * current_arch.ptrsize
+            try:
+                syscall_function_addr = read_int_from_memory(addr)
+            except gdb.MemoryError:
+                break
+            if is_x86() and syscall_function_addr % 0x10: # should be aligned
+                break
+            elif (is_arm32() or is_arm64()) and syscall_function_addr % 4: # should be aligned
+                break
+            try:
+                read_int_from_memory(syscall_function_addr) # if entry is valid, no error
+            except gdb.MemoryError:
+                break
+            symbol = get_symbol_string(syscall_function_addr, nosymbol_string=" <NO_SYMBOL>")
+            seen[syscall_function_addr] = seen.get(syscall_function_addr, 0) + 1
+            table.append([i, addr, syscall_function_addr, symbol])
+            i += 1
         # print
-        for i, addr, syscall_function_addr, symbol, is_valid in self.cached_table[tag]:
-            if i + nr_base in syscall_list.table:
-                expected_name = syscall_list.table[i + nr_base].name
-            else:
-                expected_name = "<None>"
-
-            fmt = "[{:03d}] {:<7s} {:<30s} {:#018x}: {:#018x}{:s}"
-            if seen_count[syscall_function_addr] == 1 and is_valid: # valid entry
-                msg = fmt.format(i, "valid", expected_name, addr, syscall_function_addr, symbol)
-            if seen_count[syscall_function_addr] > 1 or not is_valid: # invalid entry
-                msg = fmt.format(i, "invalid", expected_name, addr, syscall_function_addr, symbol)
-                msg = Color.grayify(msg)
-
+        fmt = "{:5s} {:18s}: {:18s} {:s}"
+        legend = ["Index", "Table Address", "Function Address", "Symbol"]
+        gef_print(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
+        for i, addr, syscall_function_addr, symbol in table:
+            if seen[syscall_function_addr] == 1: # valid entry
+                msg = "[{:03d}] {:#018x}: {:#018x}{:s}".format(i, addr, syscall_function_addr, symbol)
+            else: # invalid entry
+                msg = "[{:03d}] {:#018x}: ".format(i, addr) + Color.grayify("{:#018x}{:s}".format(syscall_function_addr, symbol))
             if not self.filter:
-                self.out.append(msg)
+                gef_print(msg)
             else:
                 for filt in self.filter:
                     if re.search(filt, msg):
-                        self.out.append(msg)
+                        gef_print(msg)
         return
 
     @parse_args
@@ -40548,51 +38550,26 @@ class SyscallTableViewCommand(GenericCommand):
     def do_invoke(self, args):
         self.dont_repeat()
 
-        self.quiet = args.quiet
         self.filter = args.filter
-        self.out = []
 
         if is_x86_32():
-            if not self.quiet:
-                self.out.append(titlify("sys_call_table (x86)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x86()
-            self.syscall_table_view("x86", sys_call_table_addr, get_syscall_table("X86", "32"))
-
+            gef_print(titlify("sys_call_table (x86)"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_x86())
         elif is_x86_64():
-            if not self.quiet:
-                self.out.append(titlify("sys_call_table (x64)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x64()
-            self.syscall_table_view("x86_64", sys_call_table_addr, get_syscall_table("X86", "64"))
-
-            if not self.quiet:
-                self.out.append(titlify("ia32_sys_call_table"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x86()
-            self.syscall_table_view("x86_N32", sys_call_table_addr, get_syscall_table("X86", "N32"))
-
-            if not self.quiet:
-                self.out.append(titlify("x32_sys_call_table"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_x32()
-            self.syscall_table_view("x86_32", sys_call_table_addr, get_syscall_table("X86", "64"), nr_base=0x40000000)
-
+            gef_print(titlify("sys_call_table (x64)"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_x64())
+            gef_print(titlify("ia32_sys_call_table"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_x86())
+            gef_print(titlify("x32_sys_call_table"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_x32())
         elif is_arm32():
-            if not self.quiet:
-                self.out.append(titlify("sys_call_table (arm32)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm32()
-            self.syscall_table_view("arm32", sys_call_table_addr, get_syscall_table("ARM", "N32"))
-
+            gef_print(titlify("sys_call_table (arm32)"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_arm32())
         elif is_arm64():
-            if not self.quiet:
-                self.out.append(titlify("sys_call_table (arm64)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm64()
-            self.syscall_table_view("arm64", sys_call_table_addr, get_syscall_table("ARM64", "ARM"))
-
-            if not self.quiet:
-                self.out.append(titlify("compat_sys_call_table (arm32)"))
-            sys_call_table_addr = KernelAddressHeuristicFinder.get_sys_call_table_arm64_compat()
-            self.syscall_table_view("arm64_32", sys_call_table_addr, get_syscall_table("ARM", "32"))
-
-        if self.out:
-            gef_print('\n'.join(self.out), less=not args.no_pager)
+            gef_print(titlify("sys_call_table (arm64)"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_arm64())
+            gef_print(titlify("compat_sys_call_table (arm32)"))
+            self.syscall_table_view(KernelAddressHeuristicFinder.get_sys_call_table_arm64_compat())
         return
 
 
@@ -40768,71 +38745,53 @@ class TlsCommand(GenericCommand):
 
     @staticmethod
     def getfs():
+        if is_remote_debug():
+            if is_x86_64():
+                return TlsCommand.get_tls_heuristic()
+            else:
+                return 0
         # fast path
         fs = get_register("$fs_base")
         if fs is not None:
             return fs
-
-        if (get_register("$cs") & 0b11) == 3:
-            # remote
-            if is_remote_debug():
-                if is_x86_64():
-                    return TlsCommand.get_tls_heuristic()
-                else:
-                    return 0
-            # slow path
-            PTRACE_ARCH_PRCTL = 30
-            ARCH_GET_FS = 0x1003
-            pid, lwpid, tid = gdb.selected_thread().ptid
-            ppvoid = ctypes.POINTER(ctypes.c_void_p)
-            value = ppvoid(ctypes.c_void_p())
-            value.contents.value = 0
-            libc = ctypes.CDLL('libc.so.6')
-            result = libc.ptrace(PTRACE_ARCH_PRCTL, lwpid, value, ARCH_GET_FS)
-            if result == 0:
-                return value.contents.value or 0
-            else:
-                return 0
+        # slow path
+        PTRACE_ARCH_PRCTL = 30
+        ARCH_GET_FS = 0x1003
+        pid, lwpid, tid = gdb.selected_thread().ptid
+        ppvoid = ctypes.POINTER(ctypes.c_void_p)
+        value = ppvoid(ctypes.c_void_p())
+        value.contents.value = 0
+        libc = ctypes.CDLL('libc.so.6')
+        result = libc.ptrace(PTRACE_ARCH_PRCTL, lwpid, value, ARCH_GET_FS)
+        if result == 0:
+            return value.contents.value or 0
         else:
-            r = gdb.execute("msr MSR_FS_BASE -q", to_string=True)
-            if r:
-                return int(r, 16)
-            else:
-                return 0
+            return 0
 
     @staticmethod
     def getgs():
+        if is_remote_debug():
+            if is_x86_32():
+                return TlsCommand.get_tls_heuristic()
+            else:
+                return 0
         # fast path
         gs = get_register("$gs_base")
         if gs is not None:
             return gs
-
-        if (get_register("$cs") & 0b11) == 3:
-            # remote
-            if is_remote_debug():
-                if is_x86_32():
-                    return TlsCommand.get_tls_heuristic()
-                else:
-                    return 0
-            # slow path
-            PTRACE_ARCH_PRCTL = 30
-            ARCH_GET_GS = 0x1004
-            pid, lwpid, tid = gdb.selected_thread().ptid
-            ppvoid = ctypes.POINTER(ctypes.c_void_p)
-            value = ppvoid(ctypes.c_void_p())
-            value.contents.value = 0
-            libc = ctypes.CDLL('libc.so.6')
-            result = libc.ptrace(PTRACE_ARCH_PRCTL, lwpid, value, ARCH_GET_GS)
-            if result == 0:
-                return value.contents.value or 0
-            else:
-                return 0
+        # slow path
+        PTRACE_ARCH_PRCTL = 30
+        ARCH_GET_GS = 0x1004
+        pid, lwpid, tid = gdb.selected_thread().ptid
+        ppvoid = ctypes.POINTER(ctypes.c_void_p)
+        value = ppvoid(ctypes.c_void_p())
+        value.contents.value = 0
+        libc = ctypes.CDLL('libc.so.6')
+        result = libc.ptrace(PTRACE_ARCH_PRCTL, lwpid, value, ARCH_GET_GS)
+        if result == 0:
+            return value.contents.value or 0
         else:
-            r = gdb.execute("msr MSR_GS_BASE -q", to_string=True)
-            if r:
-                return int(r, 16)
-            else:
-                return 0
+            return 0
 
     @staticmethod
     def get_tls():
@@ -40928,6 +38887,176 @@ class GsbaseCommand(GenericCommand):
         self.dont_repeat()
         gs_base = TlsCommand.getgs()
         gef_print("$gs_base = {:#x}".format(gs_base))
+
+        return
+
+
+@register_command
+class IdtInfoCommand(GenericCommand):
+    """Print IDT entries."""
+    _cmdline_ = "idtinfo"
+    _aliases_ = ["int"]
+    _category_ = "04-a. Register - View"
+
+    _INTERRUPT_DESCRIPTION_ = {0: "Divide Error Exception (#DE)", 1: "Debug Exception (#DB)", 2: "NMI Interrupt" , 3: "Breakpoint Exception (#BP)", 4: "Overflow Exception (#OF)" , 5: "BOUND Range Exceeded Exception (#BR)" , 6: "Invalid Opcode Exception (#UD)" , 7: "Device Not Available Exception (#NM)" , 8: "Double Fault Exception (#DF)" , 9: "Coprocessor Segment Overrun" , 10: "Invalid TSS Exception (#TS)" , 11: "Segment Not Present (#NP)" , 12: "Stack Fault Exception (#SS)" , 13: "General Protection Exception (#GP)" , 14: "Page-Fault Exception (#PF)", 16: "x87 FPU Floating-Point Error (#MF)" , 17: "Alignment Check Exception (#AC)" , 18: "Machine-Check Exception (#MC)" , 19: "SIMD Floating-Point Exception (#XM)" , 20: "Virtualization Exception (#VE)" , 21: "Control Protection Exception (#CP)" }
+    _GATE_TYPE_32_ = { 0x5: "Task Gate", 0x6: "16-bit Interrupt Gate", 0x7: "16-bit Trap Gate", 0xE: "32-bit Interrupt Gate", 0xF: "32-bit Trap Gate" }
+    _GATE_TYPE_64_ = { 0xE: "64-bit Interrupt Gate", 0xF: "64-bit Trap Gate" }
+
+    def parse_arg(arg):
+        if "," in arg:
+            arg = arg.split(",")
+            assert 2 <= len(arg) <= 3
+            arg = list(map(lambda x: int(x, 0), arg))
+
+            if len(arg) == 2:
+                if arg[0] > arg[1]:
+                    arg[0], arg[1] = arg[1], arg[0]
+
+            arg[1] += 1
+            return range(*arg)
+        else:
+            return int(arg, 0)
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("idt_numbers", type=parse_arg, nargs='*', help='idt number to get information of, it can be an integer or a range separated by a comma')
+    parser.add_argument("--null", action='store_true' , help='print also null idt entries')
+    _syntax_ = parser.format_help()
+
+
+
+    @staticmethod
+    def idt_unpack(vals):
+
+        if isinstance(vals, list):
+            val = vals[0] # for TSS/LDT
+        else:
+            val = vals # for normal
+
+        # parse
+        _idt = {}
+        _idt['value'] = val
+
+        _idt['base'] = val & 0xffff
+        _idt['segment'] = (val >> 16) & 0xffff
+        _idt['ist'] = (val >> 32) & 0b111
+        _idt['gate_type'] = (val >> 40) & (0b1111)
+        _idt['dpl'] = (val >> 45) & (0b11)
+        _idt['present'] = (val >> 47) & (0b1)
+        _idt['base'] = _idt['base'] | ((val >> 32) & (0xffff0000))
+        _idt['base'] = ((val >> 32) & (0xffffffff00000000)) | _idt['base']
+
+        Idt = collections.namedtuple("Gdt", _idt.keys())
+        return Idt(*_idt.values())
+
+    @staticmethod
+    def idtval2str(value, color=False):
+        c = Color.boldify if color else lambda x: x
+        gdt = IdtInfoCommand.idt_unpack(value)
+
+        gate_type_description = IdtInfoCommand._GATE_TYPE_64_
+
+        if gdt.gate_type in gate_type_description:
+            gate_type = f"{gdt.gate_type:#x} ({gate_type_description[gdt.gate_type]})"
+        else:
+            gate_type = f"{gdt.gate_type:#x} (?)"
+
+        if gdt.present == 0:
+            return "IDT entry is not present"
+        else:
+            fmt = ""
+            fmt += "{:#036x}".format(gdt.value) + " : "
+            fmt += "{:<#018x}".format(gdt.base) + " : "
+
+            flags = []
+            flags.append(f"segment={gdt.segment:#x}")
+            flags.append(f"ist={gdt.ist}")
+            flags.append(f"gt={gate_type}")
+            flags.append(f"dpl={gdt.dpl}")
+            flags.append(f"P={gdt.present}")
+
+            fmt = fmt + ", ".join(flags)
+            return fmt
+
+    @staticmethod
+    def idtval2str_legend():
+        fmt = "[   #] {:40s}: {:36s} : {:18s} : {:s}"
+        return fmt.format("idt name", "value", "base", "flags")
+
+
+    # print useful idt descriptor
+    def print_idt_entry(self, entries, null):
+        gef_print(titlify("IDT Entries (x64 sample)"))
+
+        c = Color.boldify
+
+        registers_color = get_gef_setting("theme.dereference_register_value")
+        # print legend
+        legend = self.idtval2str_legend()
+        gef_print(Color.colorify(legend, get_gef_setting("theme.table_heading")))
+
+        for (i, print_flag, segname, value) in entries:
+            if value != 0 or null:
+                fmt = "[0x{:>02x}] {:40s}: ".format(i, segname) + self.idtval2str(value, color=True)
+                gef_print(fmt)
+        return
+
+
+    def print_idt(self, idt_numbers, null):
+        if is_x86_64():
+            res = gdb.execute("monitor info registers", to_string=True)
+
+            # IDTR
+            red = lambda x: Color.colorify(x, "bold red")
+            yellow = lambda x: Color.colorify(x, "bold yellow")
+
+            gef_print(titlify("IDTR (Interrupt Descriptor Table Register)"))
+            idtr = re.search(r"IDT\s*=\s*(\S+) (\S+)", res)
+            base, limit = [int(idtr.group(i), 16) for i in range(1, 3)]
+
+            gef_print("{:s} = {:s}:{:s}".format(red("IDTR"), yellow("{:#x}".format(base)), yellow("{:#x}".format(limit))))
+            gef_print("base : {:s}: starting address of IDT (Interrupt Descriptor Table)".format(Color.boldify("{:#x}".format(base))))
+            gef_print("limit: {:s}: (size of IDT) - 1".format(Color.boldify("{:#x}".format(limit))))
+
+            inferior = gdb.inferiors()[0]
+
+            idt_entries = []
+
+            if len(idt_numbers) > 0:
+                idt_entries_number = set()
+                null = True
+
+                for idt_num in idt_numbers:
+                    if isinstance(idt_num, range):
+                        idt_entries_number = idt_entries_number.union(idt_num)
+                    else:
+                        idt_entries_number.add(idt_num)
+
+            else:
+                idt_entries_number = range(0x100)
+
+            for i in idt_entries_number:
+                if 0 <= i < 0xff:
+                    idt_raw = inferior.read_memory(base + i * 0x10, 0x10).tobytes()
+                    idt_value = int.from_bytes(idt_raw, "little")
+
+                    if i in self._INTERRUPT_DESCRIPTION_:
+                        idt_entries.append((i, True, self._INTERRUPT_DESCRIPTION_[i], idt_value))
+                    else:
+                        idt_entries.append((i, True, f"User defined Int {i:#x}", idt_value))
+
+            if any(map(lambda x : 0 <= x[0] <= 0xff, idt_entries)):
+                self.print_idt_entry(idt_entries, null)
+            else:
+                gef_print(titlify("IDT Entries (x64 sample)"))
+                info("You entered an invalid interrupts")
+
+        return
+
+    @parse_args
+    @only_if_specific_arch(arch=["x86_64"])
+    def do_invoke(self, args):
+        self.dont_repeat()
+        self.print_idt(**vars(args))
         return
 
 
@@ -41887,20 +40016,14 @@ class SlubDumpCommand(GenericCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('cache_name', metavar='SLUB_CACHE_NAME', nargs='*', help='filter by specific slub cache name.')
     parser.add_argument('--cpu', type=int, help="filter by specific cpu.")
-    parser.add_argument('--no-xor', action='store_true',
-                        help='skip xor to chunk->next. it is used when `kmem_cache.random` is falsely detected.')
-    parser.add_argument('--offset-random', type=lambda x: int(x, 16),
-                        help='specified offsetof(kmem_cache, random). it is used when `kmem_cache.random` is falsely detected.')
-    parser.add_argument('--no-byte-swap', action='store_true', default=None,
-                        help='skip byteswap to chunk->next. it is used when `kmem_cache.random` is falsely detected.')
+    parser.add_argument('--no-xor', action='store_true', help='skip xor to chunk->next.')
     parser.add_argument('--list', action='store_true', help='list up all slub cache names.')
     _syntax_ = parser.format_help()
 
-    _example_ = "{:s} kmalloc-256                                      # dump kmalloc-256 from all cpus\n".format(_cmdline_)
-    _example_ += "{:s} kmalloc-256 --cpu 1                              # dump kmalloc-256 from cpu 1\n".format(_cmdline_)
-    _example_ += "{:s} kmalloc-256 --no-xor                             # skip xor to chunk->next\n".format(_cmdline_)
-    _example_ += "{:s} kmalloc-256 --offset-random 0xb8 --no-byte-swap  # specified pattern of xor to chunk->next\n".format(_cmdline_)
-    _example_ += "{:s} --list                                           # list up slab cache names\n".format(_cmdline_)
+    _example_ = "{:s} kmalloc-256          # dump kmalloc-256 from all cpus\n".format(_cmdline_)
+    _example_ += "{:s} kmalloc-256 --cpu 1  # dump kmalloc-256 from cpu 1\n".format(_cmdline_)
+    _example_ += "{:s} kmalloc-256 --no-xor # skip xor to chunk->next\n".format(_cmdline_)
+    _example_ += "{:s} --list               # list up slab cache names\n".format(_cmdline_)
     _example_ += "\n"
     _example_ += "Search flow:\n"
     _example_ += "1. get address of `__per_cpu_offset`\n"
@@ -41953,9 +40076,8 @@ class SlubDumpCommand(GenericCommand):
         } reciprocal_size;                       // if kernel >= 5.9-rc1
         unsigned int offset;
         unsigned int cpu_partial;                // if CONFIG_SLUB_CPU_PARTIAL=y
-        unsigned int cpu_partial_slabs;          // if CONFIG_SLUB_CPU_PARTIAL=y && kernel >= 5.16-rc1
         struct kmem_cache_order_objects oo;
-        struct kmem_cache_order_objects max;     // if kernel < 5.19-rc1
+        struct kmem_cache_order_objects max;
         struct kmem_cache_order_objects min;
         gfp_t allocflags;
         int refcount;
@@ -41973,11 +40095,7 @@ class SlubDumpCommand(GenericCommand):
         unsigned long random;                    // if CONFIG_SLAB_FREELIST_HARDENED=y
         unsigned int remote_node_defrag_ratio;   // if CONFIG_NUMA=y
         unsigned int *random_seq;                // if CONFIG_SLAB_FREELIST_RANDOM=y
-        struct kasan_cache {
-            int alloc_meta_offset;
-            int free_meta_offset;
-            bool is_kmalloc;
-        } kasan_info;                            // if CONFIG_KASAN=y
+        struct kasan_cache kasan_info;           // if CONFIG_KASAN=y
         unsigned int useroffset;
         unsigned int usersize;
         struct kmem_cache_node *node[64];
@@ -41986,19 +40104,31 @@ class SlubDumpCommand(GenericCommand):
     struct kmem_cache_cpu {
         void **freelist;
         unsigned long tid;
-        struct slab *slab;                       // if kernel >= 5.17-rc1
-        struct page *page;                       // if kernel < 5.17-rc1
+        struct page *page;
         struct page *partial;                    // if CONFIG_SLUB_CPU_PARTIAL=y
-        local_lock_t lock;                       // if kernel >= 5.15-rc1
         unsigned stat[NR_SLUB_STAT_ITEMS];       // if CONFIG_SLUB_STATS=y
     }
     """
 
     def init_offset(self):
-        if is_64bit():
-            mask = 0x8000000000000000
+        # resolve __per_cpu_offset
+        self.__per_cpu_offset = KernelAddressHeuristicFinder.get_per_cpu_offset()
+        if self.__per_cpu_offset is None:
+            err("Failed to resolve `__per_cpu_offset`")
+            return False
         else:
-            mask = 0x80000000
+            info("__per_cpu_offset: {:#x}".format(self.__per_cpu_offset))
+
+        # resolve each cpu_offset
+        self.cpu_offset = [read_int_from_memory(self.__per_cpu_offset)]
+        i = 1
+        while True:
+            off = read_int_from_memory(self.__per_cpu_offset + i * 8)
+            if off == self.cpu_offset[-1]:
+                self.cpu_offset = self.cpu_offset[:-1]
+                break
+            self.cpu_offset.append(off)
+            i += 1
 
         # resolve slab_caches
         self.slab_caches = KernelAddressHeuristicFinder.get_slab_caches()
@@ -42008,150 +40138,100 @@ class SlubDumpCommand(GenericCommand):
         else:
             info("slab_caches: {:#x}".format(self.slab_caches))
 
-        seen = [self.slab_caches]
-        current = self.slab_caches
-        while True:
-            current = read_int_from_memory(current)
-            if current in seen:
-                break
-            seen.append(current)
-        kmem_caches = seen[1:]
-
-        # resolve __per_cpu_offset
-        __per_cpu_offset = KernelAddressHeuristicFinder.get_per_cpu_offset()
-        if __per_cpu_offset is None:
-            info("__per_cpu_offset: Not found")
-            self.cpu_offset = []
-        else:
-            info("__per_cpu_offset: {:#x}".format(__per_cpu_offset))
-            # resolve each cpu_offset
-            self.cpu_offset = [read_int_from_memory(__per_cpu_offset)]
-            i = 1
-            while True:
-                off = read_int_from_memory(__per_cpu_offset + i * 8)
-                if off == self.cpu_offset[-1]:
-                    self.cpu_offset = self.cpu_offset[:-1]
-                    break
-                self.cpu_offset.append(off)
-                i += 1
-
         # offsetof(kmem_cache, list)
-        for candidate_offset in range(current_arch.ptrsize * 2, 0x70, current_arch.ptrsize):
-            # backward search for the start of `struct kmem_cache`
-            found = True
-            seen = []
-            for kmem_cache in kmem_caches:
-                val = read_int_from_memory(kmem_cache - candidate_offset)
-                if val in [0, 0xffffffff, 0xffffffffffffffff]:
-                    found = False
-                    break
-                if val in seen:
-                    found = False
-                    break
-                else:
-                    seen.append(val)
-
-                for cpuoff in self.cpu_offset:
-                    if not is_valid_addr(align_address(val + cpuoff)):
-                        found = False
+        current = list_next = read_int_from_memory(self.slab_caches)
+        for off in range(0, 0x70, current_arch.ptrsize): # backward search for the start of `struct kmem_cache`
+            val = read_int_from_memory(current - off)
+            # search condition 1 (rare case)
+            if (is_32bit() and (val & 0x80000000)) or (is_64bit() and (val & 0x8000000000000000)):
+                try:
+                    b = read_memory(val, 0x100)
+                    if b == b"\x00" * 0x100: # read ok, but data is none. `off` just points `struct kmem_cache->cpu_slab`
                         break
-
-            if found:
-                self.kmem_cache_offset_list = candidate_offset
-                info("offsetof(kmem_cache, list): {:#x}".format(self.kmem_cache_offset_list))
+                except gdb.MemoryError: # read error, so this is not address. `off` just points `struct kmem_cache->cpu_slab`
+                    break
+            # search condition 2 (normal case)
+            a = read_int_from_memory(current - off - current_arch.ptrsize * 1)
+            b = read_int_from_memory(current - off - current_arch.ptrsize * 2)
+            if (a == b == 0) or (a == b == 0xcccccccc) or (a == b == 0xcccccccccccccccc):
+                # normal case: [..., 0x0, 0x0, struct kmem_cache, ...]
+                # rare case: [..., 0xcccccccc, 0xcccccccc, struct kmem_cache, ...]
+                # rare case: [..., 0xcccccccccccccccc, 0xcccccccccccccccc, struct kmem_caches, ...]
                 break
         else:
-            info("offsetof(kmem_cache, list): Not found")
-            return False
+            # not found, so try x64 specific condition
+            for diff in [0, 0x40]: # 0x80 or 0x40 align
+                off = (current & 0x7f) + diff
+                flags = read_int_from_memory(current - off + current_arch.ptrsize)
+                if is_x86_64() and (flags & 0xfffffffffbf00fff) == 0x0000000040000000: # heuristic flags value
+                    break
+            else:
+                err("offsetof(kmem_cache, list): Not Found")
+                raise
+        self.kmem_cache_offset_list = off
+        info("offsetof(kmem_cache, list): {:#x}".format(self.kmem_cache_offset_list))
 
         # offsetof(kmem_cache, name)
         self.kmem_cache_offset_name = self.kmem_cache_offset_list - current_arch.ptrsize
         info("offsetof(kmem_cache, name): {:#x}".format(self.kmem_cache_offset_name))
 
         # offsetof(kmem_cache, offset)
-        top = read_int_from_memory(self.slab_caches) - self.kmem_cache_offset_list
+        top = list_next - self.kmem_cache_offset_list
         objsize = u32(read_memory(top + current_arch.ptrsize * 3 + 4, 4))
         maybe_recip = u32(read_memory(top + current_arch.ptrsize * 3 + 4 + 4, 4))
         if objsize < maybe_recip or (maybe_recip % 8) != 0:
-            self.kmem_cache_offset_offset = current_arch.ptrsize * 3 + 4 + 4 + 8
+            self.kmem_cache_offset_offset = current_arch.ptrsize * 3 + 4 + 4 + current_arch.ptrsize
         else:
             self.kmem_cache_offset_offset = current_arch.ptrsize * 3 + 4 + 4
         info("offsetof(kmem_cache, offset): {:#x}".format(self.kmem_cache_offset_offset))
+
+        # offsetof(kmem_cache, random)
+        if self.no_xor:
+            self.kmem_cache_offset_random = None
+        else:
+            current = top
+            for i in range(64): # walk from list for heuristic search
+                val = read_int_from_memory(current + i * current_arch.ptrsize)
+                if is_64bit():
+                    if (val >> 48) in [0, 0xffff, 0xfffe, 0xdead, current >> 48]: # for la57: current >> 48
+                        continue
+                    if (val >> 32) == (val & 0xffffffff):
+                        continue
+                    if "{:064b}".format(val).count("1") < 6: # low entrorpy is not `random`
+                        continue
+                    if "{:064b}".format(val).count("1") > 64 - 6: # low entrorpy is not `random`
+                        continue
+                    self.kmem_cache_offset_random = i * current_arch.ptrsize
+                    info("offsetof(kmem_cache, random): {:#x}".format(self.kmem_cache_offset_random))
+                    break
+                elif is_32bit():
+                    if (val >> 8) in [0, 0xffffff]: # 0x000000**, 0xffffff** are not `random`
+                        continue
+                    if (val & ~0x0f0ff000) == 0x40000000: # flag are not `random`
+                        continue
+                    if "{:032b}".format(val).count("1") < 6: # low entrorpy is not `random`
+                        continue
+                    if "{:032b}".format(val).count("1") > 32 - 6: # low entrorpy is not `random`
+                        continue
+                    if (val & 0xf) % 4 != 0: # not aligned, it is maybe `random`
+                        self.kmem_cache_offset_random = i * current_arch.ptrsize
+                        info("offsetof(kmem_cache, random): {:#x}".format(self.kmem_cache_offset_random))
+                        break
+                    try:
+                        read_int_from_memory(val) # if no error, it is not `random`
+                        continue
+                    except Exception:
+                        self.kmem_cache_offset_random = i * current_arch.ptrsize
+                        info("offsetof(kmem_cache, random): {:#x}".format(self.kmem_cache_offset_random))
+                        break
+            else:
+                info("offsetof(kmem_cache, random): Not found")
+                self.kmem_cache_offset_random = None # maybe CONFIG_SLAB_FREELIST_HARDENED=n
 
         # offsetof(kmem_cache, cpu_slab)
         self.kmem_cache_offset_cpu_slab = 0
         # offsetof(kmem_cache, object_size)
         self.kmem_cache_offset_object_size = current_arch.ptrsize * 3 + 4
-        info("offsetof(kmem_cache, object_size): {:#x}".format(self.kmem_cache_offset_object_size))
-
-        # offsetof(kmem_cache, random)
-        if self.no_xor:
-            self.kmem_cache_offset_random = None
-            info("offsetof(kmem_cache, random): None")
-        elif self.offset_random is not None:
-            self.kmem_cache_offset_random = self.offset_random
-            info("offsetof(kmem_cache, random): {:#x}".format(self.kmem_cache_offset_random))
-        else:
-            for i in range(2, 0x40): # walk from list for heuristic search
-                candidate_offset = current_arch.ptrsize * i
-                found = True
-                count = 0
-                seen = []
-                for kmem_cache in kmem_caches:
-                    val = read_int_from_memory(kmem_cache + candidate_offset)
-                    if is_valid_addr(val):
-                        count += 1
-                        if count >= 3:
-                            found = False
-                            break
-                    else:
-                        if val > 0xffffff:
-                            count -= 1
-
-                    if val != 0:
-                        if val in seen:
-                            found = False
-                            break
-                        seen.append(val)
-
-                if found:
-                    # Too few random numbers.
-                    if len(seen) < 10:
-                        found = False
-
-                    # Ocurrences of non-negative small integers are stochastically rare.
-                    elif sum([0 < x < 0x100000 for x in seen]) >= 3:
-                        found = False
-
-                    # Ocurrences of big integers are stochastically rare.
-                    elif sum([0xffff000000000000 < x <= 0xffffffffffffffff for x in seen]) >= 3:
-                        found = False
-
-                    # Occurrences of 0xXXXX000 are stochastically rare.
-                    elif sum([x and (x & 0xfff) == 0 for x in seen]) >= 3:
-                        found = False
-
-                if found:
-                    # search `struct kmem_cache_node *node` or `unsigned int *random_seq`
-                    for i in range(1, 9):
-                        maybe_ptrs = []
-                        for kmem_cache in kmem_caches:
-                            v = read_int_from_memory(kmem_cache + candidate_offset + current_arch.ptrsize * i)
-                            maybe_ptrs.append(v)
-                        # they should be at the same offset
-                        if all([is_valid_addr(p) for p in maybe_ptrs]):
-                            break
-                    else:
-                        found = False
-
-                if found:
-                    self.kmem_cache_offset_random = self.kmem_cache_offset_list + candidate_offset
-                    info("offsetof(kmem_cache, random): {:#x}".format(self.kmem_cache_offset_random))
-                    break
-            else:
-                info("offsetof(kmem_cache, random): Not found")
-                self.kmem_cache_offset_random = None # maybe CONFIG_SLAB_FREELIST_HARDENED=n
-
         # offsetof(kmem_cache_cpu, freelist)
         self.kmem_cache_cpu_offset_freelist = 0
         return True
@@ -42179,10 +40259,7 @@ class SlubDumpCommand(GenericCommand):
 
     def get_kmem_cache_cpu(self, addr, cpu):
         cpu_slab = read_int_from_memory(addr + self.kmem_cache_offset_cpu_slab)
-        if len(self.cpu_offset) > 0:
-            kmem_cache_cpu = cpu_slab + self.cpu_offset[cpu]
-        else:
-            kmem_cache_cpu = cpu_slab
+        kmem_cache_cpu = cpu_slab + self.cpu_offset[cpu]
         if is_64bit():
             return kmem_cache_cpu & 0xffffffffffffffff
         else:
@@ -42233,6 +40310,7 @@ class SlubDumpCommand(GenericCommand):
     def walk_caches(self, cpu):
         current_kmem_cache = self.get_next_kmem_cache(self.slab_caches, point_to_base=False)
         self.parsed_caches = [{'name': 'slab_caches', 'next': current_kmem_cache}]
+        self.swap = None
 
         while current_kmem_cache + self.kmem_cache_offset_list != self.slab_caches:
             new_cache = {}
@@ -42284,12 +40362,11 @@ class SlubDumpCommand(GenericCommand):
             gef_print(' |   kmem_cache_cpu (cpu{:d}): {:#x}'.format(cpu, c['kmem_cache_cpu']))
             gef_print(' |   offset (offset to next pointer in chunk): {:#x}'.format(c['offset']))
             gef_print(' |   objsize: {:s}'.format(Color.colorify("{:#x}".format(c['objsize']), "bold pink")))
-            if self.kmem_cache_offset_random is not None:
-                if self.no_xor is False:
-                    if self.swap is True:
-                        gef_print(' |   random (xor key): {:#x} ^ byteswap(address of chunk->next)'.format(c['random']))
-                    else:
-                        gef_print(' |   random (xor key): {:#x} ^ address of chunk->next'.format(c['random']))
+            if c['random']:
+                if self.no_xor is False and self.swap is True:
+                    gef_print(' |   random (xor key): {:#x} ^ byteswap(address of chunk->next)'.format(c['random']))
+                else:
+                    gef_print(' |   random (xor key): {:#x} ^ address of chunk->next'.format(c['random']))
             if len(c['freelist']) > 0:
                 if isinstance(c['freelist'][0], str):
                     gef_print(' |   freelist:   {:s}'.format(c['freelist'][0]))
@@ -42326,17 +40403,17 @@ class SlubDumpCommand(GenericCommand):
             return
 
         if self.cpuN is None:
-            for i in range(len(self.cpu_offset) or 1):
+            for i in range(len(self.cpu_offset)):
                 gef_print(titlify("CPU {:d}".format(i)))
                 self.walk_caches(i)
                 self.dump_caches(targets, i)
         else:
-            if (len(self.cpu_offset) or 1) > self.cpuN:
+            if len(self.cpu_offset) > self.cpuN:
                 gef_print(titlify("CPU {:d}".format(self.cpuN)))
                 self.walk_caches(self.cpuN)
                 self.dump_caches(targets, self.cpuN)
             else:
-                err("CPU number is invalid (valid range:{:d}-{:d})".format(0, (len(self.cpu_offset) or 1) - 1))
+                err("CPU number is invalid (valid range:{:d}-{:d})".format(0, len(self.cpu_offset) - 1))
         return
 
     @parse_args
@@ -42349,96 +40426,112 @@ class SlubDumpCommand(GenericCommand):
         self.cpuN = args.cpu
         self.no_xor = args.no_xor
         self.listup = args.list
-        self.offset_random = args.offset_random
-        if args.no_byte_swap is None:
-            self.swap = None
-        else:
-            self.swap = not args.no_byte_swap
 
         info("Wait for memory scan")
 
-        r = gdb.execute("ksymaddr-remote --quiet slub_", to_string=True)
-        if not r:
-            err("Unsupported SLAB, SLOB")
-            return
-
-        self.slabwalk(args.cache_name)
+        try:
+            self.slabwalk(args.cache_name)
+        except Exception:
+            err("Memory corrupted")
         return
 
 
 @register_command
 class KsymaddrRemoteCommand(GenericCommand):
     """Solve kernel symbols from kallsyms table using kenrel memory scanning."""
-    # Thanks to https://github.com/marin-m/vmlinux-to-elf
     _cmdline_ = "ksymaddr-remote"
     _category_ = "08-b. Qemu-system Cooperation - Linux"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('keyword', metavar='KEYWORD', nargs='*', help='filter by specific symbol name.')
+    parser.add_argument('--print-all', action='store_true', help='print all symbols found.')
+    parser.add_argument('--head', metavar='N', type=int, default=-1, help="filter by first N hit.")
     parser.add_argument('--exact', action='store_true', help='use exact match.')
-    parser.add_argument('-q', '--quiet', action='store_true', help='enable quiet mode.')
-    parser.add_argument('-v', '--verbose', action='store_true', help='enable verbose mode.')
-    parser.add_argument('-r', '--reparse', action='store_true', help='do not use cache.')
+    parser.add_argument('--meta', action='store_true', help='print meta data for debug.')
+    parser.add_argument('--silent', action='store_true', help='enable quiet mode.')
     _syntax_ = parser.format_help()
 
-    _example_ = "{:s} commit_creds prepare_kernel_cred # OR search\n".format(_cmdline_)
+    _example_ = "{:s} --print-all                      # print all symbols found\n".format(_cmdline_)
+    _example_ += "{:s} cred --head 30                   # print symbols included `cred` with only first 30 hit\n".format(_cmdline_)
+    _example_ += "{:s} cred --silent                    # print symbols included `cred` with quiet mode\n".format(_cmdline_)
+    _example_ += "{:s} commit_creds prepare_kernel_cred # OR search\n".format(_cmdline_)
+    _example_ += "Search flow:\n"
+    _example_ += "1. get address of kernel_base\n"
+    _example_ += "2. get address of kernel_base_rodata\n"
+    _example_ += "3. get address of kallsyms_relative_base\n"
+    _example_ += "4. get address of kallsyms_names\n"
+    _example_ += "5. get address of kallsyms_offsets\n"
+    _example_ += "6. get address of kallsyms_token_table\n"
+    _example_ += "7. get address of kallsyms_token_index\n"
+    _example_ += "8. walk kallsyms\n"
+    _example_ += "THIS FEATURE IS EXPERIMENTAL AND HEURISTIC."
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.initialized = False
+        self.maps = None
         self.kallsyms = []
         return
 
-    def verbose_info(self, msg):
-        if self.verbose:
-            msg = "{} {}".format(Color.colorify("[+]", "bold blue"), msg)
-            gef_print(msg)
-        return
+    def expand_symbol(self, off):
+        data = off
+        len_ = self.kallsyms_names[data]
 
-    def quiet_info(self, msg):
-        if not self.quiet:
-            msg = "{} {}".format(Color.colorify("[+]", "bold blue"), msg)
-            gef_print(msg)
-        return
+        data += 1
 
-    def quiet_err(self, msg):
-        if not self.quiet:
-            msg = "{} {}".format(Color.colorify("[+]", "bold red"), msg)
-            gef_print(msg)
-        return
+        symbol = ""
+        skipped_first = False
+        off = len_ + 1
+        while len_:
+            tptr = self.kallsyms_token_index[self.kallsyms_names[data]]
 
-    def get_token_table(self):
-        # Parse symbol name tokens
-        tokens = []
-        position = self.kallsyms_token_table__offset
-        for num_token in range(256):
-            token = ''
-            while self.kernel_img[position]:
-                token += chr(self.kernel_img[position])
-                position += 1
-            position += 1
-            tokens.append(token)
-        return tokens
+            data += 1
+            len_ -= 1
+
+            while True:
+                c = self.kallsyms_token_table[tptr]
+                if c == 0:
+                    break
+                if skipped_first:
+                    symbol += chr(c)
+                else:
+                    skipped_first = True
+                tptr += 1
+        return off, symbol
+
+
+    def kallsyms_sym_address(self, idx):
+        if self.kallsyms_relative_base is None:
+            relative_base = 0
+        else:
+            relative_base = self.kallsyms_relative_base
+
+        val = self.kallsyms_offsets[idx]
+        if not self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU:
+            return relative_base + val
+        if val >= 0:
+            return val
+        else:
+            return relative_base - 1 - val
+
+    def kallsyms_get_symbol_type(self, off):
+        idx1 = self.kallsyms_names[off + 1]
+        idx2 = self.kallsyms_token_index[idx1]
+        typ = self.kallsyms_token_table[idx2]
+        return chr(typ)
 
     def resolve_kallsyms(self):
         if self.kallsyms != []: # resolved already
             return
+        off = 0
 
-        tokens = self.get_token_table()
-        symbol_names = []
-        position = self.kallsyms_names__offset
-        for num_symbol in range(self.num_symbols):
-            symbol_name = ''
-            length = self.kernel_img[position]
-            position += 1
-            for i in range(length):
-                symbol_token_index = self.kernel_img[position]
-                symbol_token = tokens[symbol_token_index]
-                position += 1
-                symbol_name += symbol_token
-            symbol_names.append(symbol_name)
-
-        for addr, name in zip(self.kernel_addresses, symbol_names):
-            self.kallsyms.append([addr, name[1:], name[0]])
+        for i in range(self.kallsyms_num_syms):
+            print(i, end="\r") 
+            offdiff, symbol = self.expand_symbol(off)
+            typ = self.kallsyms_get_symbol_type(off)
+            off += offdiff
+            addr = self.kallsyms_sym_address(i)
+            self.kallsyms.append([addr, symbol, typ])
         return
 
     def print_kallsyms(self, keywords):
@@ -42446,408 +40539,734 @@ class KsymaddrRemoteCommand(GenericCommand):
             fmt = "{:#010x} {:s} {:s}"
         else:
             fmt = "{:#018x} {:s} {:s}"
-
+        print_count = 0
         for addr, symbol, typ in self.kallsyms:
-            if not keywords:
+            if print_count == self.head:
+                break
+            if self.print_all:
                 gef_print(fmt.format(addr, typ, symbol))
-                continue
-
-            for k in keywords:
-                text = fmt.format(addr, typ, symbol)
-                if self.exact:
-                    if k == symbol:
+                print_count += 1
+            else:
+                for k in keywords:
+                    text = fmt.format(addr, typ, symbol)
+                    if self.exact and k == symbol:
                         gef_print(text)
+                        print_count += 1
                         break
-                else:
-                    if k in text:
+                    elif not self.exact and k in text:
                         gef_print(text)
+                        print_count += 1
                         break
         return
 
-    def initialize(self):
-        if is_big_endian():
-            endianness_marker = '>'
-        else:
-            endianness_marker = '<'
+    # Initialize variables in different ways, depending on the situation.
+    #
+    # The variables need to find are as follows.
+    # 1. kallsyms_relative_base
+    # 2. kallsyms_num_syms
+    # 3. kallsyms_names
+    # 4. CONFIG_KALLSYMS_ABSOLUTE_PERCPU is enabled or not
+    # 5. kallsyms_offsets
+    # 6. kallsyms_markers
+    # 7. kallsyms_token_table
+    # 8. kallsyms_token_index
+    #
+    # The method for searching the above variables is different for 64bit / 32bit.
+    # It also depends on whether each variable in memory has a large padding (called sparse) or not (called normal).
+    #
+    # Variables to use
+    #   self.kbase:         address of kernel .text
+    #   self.krobase:       address of kernel .rodata
+    #   self.RO_REGION:     data of .rodata; bytes([0xef, 0xbe, 0xad, 0xde...])
+    #   self.RO_REGION_u32: data of .rodata; [0xdeadbeef, ...]
+    #   self.RO_REGION_u64: data of .rodata; [0x00000000deadbeef, ...]
 
-        # find kallsyms_token_table
-
-        position = 0
-        candidates_offsets = []
-        candidates_offsets_followed_with_ascii = []
-        seq_to_find = b'0\x001\x002\x003\x004\x005\x006\x007\x008\x009\x00'
-        seq_to_avoid = [b':\0', b'\0\0', b'\0\1', b'\0\2', b'ASCII\0']
-
-        while True:
-            position = self.kernel_img.find(seq_to_find, position + 1)
-            if position == -1:
-                break
-
-            for seq in seq_to_avoid:
-                pos = position + len(seq_to_find)
-                if self.kernel_img[pos:pos + len(seq)] == seq:
-                    break
-            else:
-                candidates_offsets.append(position)
-                if self.kernel_img[pos:pos + 1].isalnum():
-                    candidates_offsets_followed_with_ascii.append(position)
-
-        if len(candidates_offsets) != 1:
-            if len(candidates_offsets_followed_with_ascii) == 1:
-                candidates_offsets = candidates_offsets_followed_with_ascii
-            else:
-                self.quiet_err('{:d} candidates for kallsyms_token_table in kernel image'.format(len(candidates_offsets)))
-                return False
-        position = candidates_offsets[0]
-
-        # Get back to the beginning of the table
-        current_index_in_array = ord('0')
-        position -= 1
-        if position < 0 or self.kernel_img[position] != 0:
-            self.quiet_err('Could not find kallsyms_token_table')
-            return False
-
-        for tokens_backwards in range(current_index_in_array):
-            for chars_in_token_backwards in range(50):
-                position -= 1
-                if position < 0:
-                    self.quiet_err('Could not find kallsyms_token_table')
-                    return False
-                # we may overlap on "kallsyms_markers" for the last entry, so also check for high-range characters
-                if self.kernel_img[position] == 0 or self.kernel_img[position] > ord('z'):
-                    break
-                if chars_in_token_backwards >= 50 - 1:
-                    self.quiet_err('This structure is not a kallsyms_token_table')
-                    return False
-        position += 1
-        position += -position % 4
-        self.kallsyms_token_table__offset = position
-        self.verbose_info('kallsyms_token_table: {:#x}'.format(self.krobase + self.kallsyms_token_table__offset))
-
-        # find kallsyms_token_index
-
-        # Get to the end of the kallsyms_token_table
-        current_index_in_array = 0
-        position = self.kallsyms_token_table__offset
-        all_token_offsets = []
-        position -= 1
-
-        for tokens_forward in range(256):
-            position += 1
-            all_token_offsets.append(position - self.kallsyms_token_table__offset)
-            for chars_in_token_forward in range(50):
-                position += 1
-                if self.kernel_img[position] == 0:
-                    break
-                if chars_in_token_forward >= 50 - 1:
-                    self.quiet_err('This structure is not a kallsyms_token_table')
-                    return False
-
-        # Find kallsyms_token_index through the offset through searching
-        # the reconstructed structure, also use this to guess endianness
-        MAX_ALIGNMENT = 256
-        KALLSYMS_TOKEN_INDEX__SIZE = 256 * 2
-        memory_to_search = bytes(self.kernel_img[position:position + KALLSYMS_TOKEN_INDEX__SIZE + MAX_ALIGNMENT])
-
-        if is_big_endian():
-            offsets = struct.pack('>{:d}H'.format(len(all_token_offsets)), *all_token_offsets)
-        else:
-            offsets = struct.pack('<{:d}H'.format(len(all_token_offsets)), *all_token_offsets)
-
-        found_position = memory_to_search.find(offsets)
-        if found_position == -1:
-            self.quiet_err('The value of kallsyms_token_index was not found')
-            return False
-        self.kallsyms_token_index__offset = position + found_position
-        self.verbose_info('kallsyms_token_index: {:#x}'.format(self.krobase + self.kallsyms_token_index__offset))
-
-        # find kallsyms_markers
-
-        max_number_of_space_between_two_nulls = 0
-        position = self.kallsyms_token_table__offset
-
-        # Go just before the first chunk of non-null bytes
-        while position > 0 and self.kernel_img[position - 1] == 0:
-            position -= 1
-
-        for null_separated_bytes_chunks in range(20):
-            num_non_null_bytes = 1 # we always start at a non-null byte in this loop
-            num_null_bytes = 1 # we will at least encounter one null byte before the end of this loop
-            while True:
-                position -= 1
-                if position < 0:
-                    self.quiet_err('Could not find kallsyms_markers')
-                    return False
-                if self.kernel_img[position] == 0:
-                    break
-                num_non_null_bytes += 1
-            while True:
-                position -= 1
-                if position < 0:
-                    self.quiet_err('Could not find kallsyms_markers')
-                    return False
-                if self.kernel_img[position] != 0:
-                    break
-                num_null_bytes += 1
-            max_number_of_space_between_two_nulls = max(
-                max_number_of_space_between_two_nulls,
-                num_non_null_bytes + num_null_bytes)
-        if max_number_of_space_between_two_nulls % 2 == 1: # There may be a leap to a shorter offset in the latest processed entries
-            max_number_of_space_between_two_nulls -= 1
-        if max_number_of_space_between_two_nulls not in (2, 4, 8):
-            self.quiet_err('Could not guess the architecture register size for kernel')
-            return False
-
-        self.offset_table_element_size = max_number_of_space_between_two_nulls
-        # Once the size of a long has been guessed, use it to find
-        # the first offset (0)
-        position = self.kallsyms_token_table__offset
-        MAX_ARRAY_SIZE = 3000 * self.offset_table_element_size
-
-        position -= 1
-        while position > 0 and self.kernel_img[position] == 0:
-            position -= 1
-
-        needle = self.kernel_img.rfind(b'\x00' * self.offset_table_element_size, position - MAX_ARRAY_SIZE, position)
-        if needle == -1:
-            self.quiet_err('Could not find kallsyms_markers')
-            return False
-        position = needle
-        position -= position % self.offset_table_element_size
-
-        self.kallsyms_markers__offset = position
-        self.verbose_info('kallsyms_markers: {:#x}'.format(self.krobase + self.kallsyms_markers__offset))
-
-        # find kallsyms_names
-
-        position = self.kallsyms_markers__offset
-
-        # Approximate the position of kallsyms_names based on the last entry of "kallsyms_markers"
-        # - we'll determine the precise position in the next method
-        long_size_marker = {2: 'H', 4: 'I', 8: 'Q'}[self.offset_table_element_size]
-        size_of_kallsyms_markers_entries = self.kallsyms_token_table__offset - self.kallsyms_markers__offset
-        num_of_kallsyms_markers_entries = size_of_kallsyms_markers_entries // self.offset_table_element_size
-        unpack_fmt = endianness_marker + str(num_of_kallsyms_markers_entries) + long_size_marker
-        kallsyms_markers_entries = struct.unpack_from(unpack_fmt, self.kernel_img, self.kallsyms_markers__offset)
-        last_kallsyms_markers_entry = list(filter(None, kallsyms_markers_entries))[-1]
-        position -= last_kallsyms_markers_entry
-        position += -position % self.offset_table_element_size
-
-        if position <= 0:
-            self.quiet_err('Could not find kallsyms_names')
-            return False
-
-        self.kallsyms_names__offset = position
-        # Guessing continues in the function below (in order to handle the absence of padding)
-
-        # find kallsyms_num_syms
-
-        needle = -1
-        token_table = self.get_token_table()
-        possible_symbol_types = list('ABDRTVWGINPCSUuvw-?')
-        dp = []
-        while needle == -1:
-            position = self.kallsyms_names__offset
-
-            # Check whether this looks like the correct symbol table, first depending on the beginning of the
-            # first symbol (as this is where an uncertain gap of 4 padding bytes may be present depending on
-            # versions or builds), then thorough the whole table. Raise an issue further in the code (in
-            # another function) if an exotic kind of symbol is found somewhere else than in the first entry.
-
-            first_token_index_of_first_name = self.kernel_img[position + 1]
-            first_token_of_first_name = token_table[first_token_index_of_first_name]
-
-            x = first_token_of_first_name[0]
-            if not (x.lower() in 'uvw' and x in possible_symbol_types) and x.upper() not in possible_symbol_types:
-                self.kallsyms_names__offset -= 4
-                if self.kallsyms_names__offset < 0:
-                    self.quiet_err('Could not find kallsyms_names')
-                    return False
-                continue
-
-            # Each entry in the symbol table starts with a u8 size followed by the contents.
-            # The table ends with an entry of size 0, and must lie before kallsyms_markers.
-            # This for loop uses a bottom-up DP approach to calculate the numbers of symbols without recalculations.
-            # dp[i] is the length of the symbol table given a starting position of "kallsyms_markers - i"
-            # If the table position is invalid, i.e. it reaches out of bounds, the length is marked as -1.
-            # The loop ends with the number of symbols for the current position in the last entry of dp.
-
-            for i in range(len(dp), self.kallsyms_markers__offset - position + 1):
-                symbol_size = self.kernel_img[self.kallsyms_markers__offset - i]
-                next_i = i - symbol_size - 1
-                if symbol_size == 0:
-                    # Last entry of the symbol table
-                    dp.append(0)
-                elif next_i < 0 or dp[next_i] == -1:
-                    # If table would exceed kallsyms_markers, mark as invalid
-                    dp.append(-1)
-                else:
-                    dp.append(dp[next_i] + 1)
-            num_symbols = dp[-1]
-
-            if num_symbols < 256:
-                self.kallsyms_names__offset -= 4
-                if self.kallsyms_names__offset < 0:
-                    self.quiet_err('Could not find kallsyms_names')
-                    return False
-                continue
-            self.num_symbols = num_symbols
-
-            # Find the long or PTR (it should be the same size as a kallsyms_marker entry)
-            # encoding the number of symbols right before kallsyms_names
-            long_size_marker = {2: 'H', 4: 'I', 8: 'Q'}[self.offset_table_element_size]
-            MAX_ALIGNMENT = 256
-            encoded_num_symbols = struct.pack(endianness_marker + long_size_marker, num_symbols)
-            start = max(0, self.kallsyms_names__offset - MAX_ALIGNMENT - 20)
-            needle = self.kernel_img.rfind(encoded_num_symbols, start, self.kallsyms_names__offset)
-
-            # There may be no padding between kallsyms_names and kallsyms_num_syms,
-            # if the alignment is already correct: in this case: try other offsets for "kallsyms_names"
-            if needle == -1:
-                self.kallsyms_names__offset -= 4
-                if self.kallsyms_names__offset < 0:
-                    self.quiet_err('Could not find kallsyms_names')
-                    return False
-
-        self.verbose_info('kallsyms_names: {:#x}'.format(self.krobase + self.kallsyms_names__offset))
-        position = needle
-        self.kallsyms_num_syms__offset = position
-        self.verbose_info('kallsyms_num_syms: {:#x}'.format(self.krobase + self.kallsyms_num_syms__offset))
-
-        # find kallsyms_addresses_or_symbols
-
-        regex_match = re.search(b'Linux version (\d+\.[\d.]*\d)[ -~]+', self.kernel_img)
-        version_string = regex_match.group(0).decode('ascii')
-        version_number = regex_match.group(1).decode('ascii')
-        kernel_major = int(version_number.split('.')[0])
-        kernel_minor = int(version_number.split('.')[1])
-
-        # Is CONFIG_KALLSYMS_BASE_RELATIVE ?
-        likely_has_base_relative = False
-        if kernel_major > 4 or (kernel_major == 4 and kernel_minor >= 6):
-            if 'ia64' not in version_string.lower() and 'itanium' not in version_string.lower():
-                likely_has_base_relative = True
-
-        # Is CONFIG_KALLSYMS_ABSOLUTE_PERCPU ?
-        # We'll guess through looking for negative symbol values. Try different possibilities heuristically:
-        for (has_base_relative, can_skip) in (
-            [(True, True), (False, False)]
-            if likely_has_base_relative else
-            [(False, True), (False, False)]
-        ):
-            position = self.kallsyms_num_syms__offset
-            if is_64bit():
-                address_byte_size = 8
-            else:
-                address_byte_size = self.offset_table_element_size
-            offset_byte_size = min(4, self.offset_table_element_size) # Size of an assembly ".long"
-
-            # Go right after the previous address
-            while True:
-                previous_word = self.kernel_img[position - address_byte_size:position]
-                if previous_word != address_byte_size * b'\x00':
-                    break
-                position -= address_byte_size
-
-            if has_base_relative:
-                self.has_base_relative = True
-                position -= address_byte_size
-
-                # Parse the base_relative value
-                if is_big_endian():
-                    endian_str = 'big'
-                else:
-                    endian_str = 'little'
-                self.relative_base_address = int.from_bytes(self.kernel_img[position:position + address_byte_size], endian_str)
-
-                # Go right after the previous offset
-                while True:
-                    previous_word = self.kernel_img[position - offset_byte_size:position]
-                    if previous_word != offset_byte_size * b'\x00':
-                        break
-                    position -= offset_byte_size
-                position -= self.num_symbols * offset_byte_size
-
-            else:
-                self.has_base_relative = False
-                position -= self.num_symbols * address_byte_size
-
-            self.kallsyms_addresses_or_offsets__offset = position
-
-            # Check the obtained values
-            if self.has_base_relative:
-                # offsets may be negative, contrary to addresses
-                long_size_marker = {2: 'h', 4: 'i'}[offset_byte_size]
-            else:
-                long_size_marker = {2: 'H', 4: 'I', 8: 'Q'}[address_byte_size]
-
-            # Parse symbols addresses
-            fmt = endianness_marker + str(self.num_symbols) + long_size_marker
-            unpacked = struct.unpack_from(fmt, self.kernel_img, self.kallsyms_addresses_or_offsets__offset)
-            tentative_addresses_or_offsets_ = list(unpacked)
-
-            if self.has_base_relative:
-                number_of_negative_items = len([offset for offset in tentative_addresses_or_offsets_ if offset < 0])
-                # Non-absolute symbols are negative with CONFIG_KALLSYMS_ABSOLUTE_PERCPU
-                if number_of_negative_items / len(tentative_addresses_or_offsets_) >= 0.5:
-                    self.has_absolute_percpu = True
-                    tentative_addresses_or_offsets = []
-                    for offset in tentative_addresses_or_offsets_:
-                        if offset < 0:
-                            x = self.relative_base_address - 1 - offset
-                            tentative_addresses_or_offsets.append(x)
-                        else:
-                            tentative_addresses_or_offsets.append(offset)
-                else:
-                    self.has_absolute_percpu = False
-                    tentative_addresses_or_offsets = []
-                    for offset in tentative_addresses_or_offsets_:
-                        x = offset + self.relative_base_address
-                        tentative_addresses_or_offsets.append(x)
-            else:
-                self.has_absolute_percpu = False
-                tentative_addresses_or_offsets = tentative_addresses_or_offsets_
-
-            number_of_null_items = len([address for address in tentative_addresses_or_offsets if address == 0])
-            # If there are too much null symbols we have likely tried to parse the wrong integer size
-            if number_of_null_items / len(tentative_addresses_or_offsets) >= 0.2:
-                if can_skip:
+    # 32bit is very complicated. 64bit is simple
+    def initialize32_kallsyms_relative_base(self):
+        # 1. find kbase from rodata
+        if is_x86_32():
+            # recent kernel (buildroot:5.4.58, debian11.3:5.10.0-13)
+            for idx, tmp in enumerate(self.RO_REGION_u32[:-1]):
+                if tmp & 0xfff: # should be aligned
                     continue
+                if (tmp & 0xffff0000) != (self.kbase & 0xffff0000): # holds around kbase
+                    continue
+                if self.RO_REGION_u32[idx + 1] > 0x4ffff: # next address is kallsyms_num_syms. too large number is fail
+                    continue
+                if 0 < self.RO_REGION_u32[idx + 1] < 0x100 : # next address is kallsyms_num_syms. too small number is fail
+                    continue
+                self.kallsyms_relative_base = tmp
+                self.kallsyms_relative_base_off = idx
+                self.kallsyms_relative_base_addr = self.krobase + self.kallsyms_relative_base_off * 4
+                return
 
-            if self.has_base_relative:
-                self.verbose_info('kallsyms_offsets: {:#x}'.format(self.krobase + self.kallsyms_addresses_or_offsets__offset))
-            else:
-                self.verbose_info('kallsyms_addresses: {:#x}'.format(self.krobase + self.kallsyms_addresses_or_offsets__offset))
-            self.kernel_addresses = tentative_addresses_or_offsets
-            break
+            # i386 (ooofs:4.4.223)
+            for i, val in enumerate(self.RO_REGION_u32[::-1]): # use backward search because if found multiple then select the last one
+                if val == self.kbase:
+                    pos = len(self.RO_REGION_u32) - i - 1
+                    # found contiguous, go prev as possilbe
+                    while self.RO_REGION_u32[pos] == self.RO_REGION_u32[pos - 1]:
+                        pos -= 1
+                    self.kallsyms_relative_base = self.kbase
+                    self.kallsyms_relative_base_off = pos
+                    self.kallsyms_relative_base_addr = self.krobase + self.kallsyms_relative_base_off * 4
+                    return
+
+        elif is_arm32():
+            # recent kernel (debian 11.3:5.10.0-14)
+            for idx, tmp in enumerate(self.RO_REGION_u32[:-1]):
+                if tmp & 0xfff: # should be aligned
+                    continue
+                if (tmp & 0xffff0000) != (self.kbase & 0xffff0000): # holds around kbase
+                    continue
+                if self.RO_REGION_u32[idx + 1] > 0x4ffff: # next address is kallsyms_num_syms. too large number is fail
+                    continue
+                if 0 < self.RO_REGION_u32[idx + 1] < 0x100 : # next address is kallsyms_num_syms. too small number is fail
+                    continue
+                self.kallsyms_relative_base = tmp
+                self.kallsyms_relative_base_off = idx
+                self.kallsyms_relative_base_addr = self.krobase + self.kallsyms_relative_base_off * 4
+                return
+
+            # ARM has specific relative_base (buildroot:5.4.58, debian10.4:4.19.0-9)
+            for i in range(4):
+                try:
+                    kbase_diff = -(0x100000 * i + 0xf8000)
+                    self.kallsyms_relative_base = self.kbase + kbase_diff
+                    self.kallsyms_relative_base_off = self.RO_REGION_u32.index(self.kallsyms_relative_base)
+                    self.kallsyms_relative_base_addr = self.krobase + self.kallsyms_relative_base_off * 4
+                    if self.meta:
+                        info("kbase difference is {:#x}".format(kbase_diff))
+                    return
+                except Exception:
+                    pass
+
+        # not found
+        if not self.silent:
+            err("Failed to identified kallsyms_relative_base (not found kernel_base in kernel_robase)")
+        self.kallsyms_relative_base = None
+        self.kallsyms_relative_base_off = None
+        self.kallsyms_relative_base_addr = None
+        return
+
+    def initialize32_sparse_kallsyms_num_syms(self):
+        # 1. next to it (16 bytes aligned)
+        self.kallsyms_num_syms_addr = self.kallsyms_relative_base_addr + 0x10
+        self.kallsyms_num_syms_off = self.kallsyms_relative_base_off + 4
+        self.kallsyms_num_syms = self.RO_REGION_u32[self.kallsyms_num_syms_off]
+        return
+
+    def initialize32_sparse_kallsyms_names(self):
+        # 1. next to it (16 bytes aligned)
+        self.kallsyms_names_addr = self.kallsyms_num_syms_addr + 0x10
+        self.kallsyms_names_off = self.kallsyms_num_syms_off + 4
+        return
+
+    def initialize32_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU(self):
+        # 1. walk to prev and found non-zero value
+        # 2. if the MSB of the element is on, then it is pattern 4 at kallsyms_sym_address() in root/kernel/kallsyms.c.
+        #    so not pattern 2, therefore, CONFIG_KALLSYMS_ABSOLUTE_PERCPU = True
+        pos = self.kallsyms_relative_base_off - 4
+        while self.RO_REGION_u32[pos] == 0:
+            pos -= 1
+        self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU = (((self.RO_REGION_u32[pos] >> 31) & 1) == 1)
+        return
+
+    def initialize32_sparse_kallsyms_offsets(self):
+        # 1. calc
+        if self.kallsyms_relative_base is None:
+            self.kallsyms_offsets_addr = self.kallsyms_num_syms_addr - self.kallsyms_num_syms * 4
+        else:
+            self.kallsyms_offsets_addr = self.kallsyms_relative_base_addr - self.kallsyms_num_syms * 4
+        self.kallsyms_offsets_addr &= ~0xf # 16 bytes aligned
+        return
+
+    def initialize32_sparse_kallsyms_markers(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_names_off
+        while True:
+            if self.RO_REGION_u32[pos] == 0 and pos % 4 == 0:
+                self.kallsyms_markers_off = pos
+                self.kallsyms_markers_addr = self.krobase + pos * 4
+                break
+            pos += 1
+        return
+
+    def initialize32_sparse_kallsyms_token_table(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_markers_off
+        while True: # use pos above
+            v = self.RO_REGION_u32[pos]
+            if v & 0xff000000 > 0 or (self.RO_REGION_u32[pos - 1] > 0 and self.RO_REGION_u32[pos - 1] * 4 < v):
+                self.kallsyms_token_table_addr = self.krobase + pos * 4
+                break
+            pos += 4
+        return
+
+    def initialize32_sparse_kallsyms_token_index(self):
+        # 1. walk to next until contiguous zero value. it is end of marker of kallsyms_token_table
+        # 2. align
+        pos = self.kallsyms_token_table_addr - self.krobase
+        while True:
+            if self.RO_REGION[pos] == 0 and self.RO_REGION[pos + 1] == 0:
+                pos += 1
+                while pos % 16: # need align
+                    pos += 1
+                self.kallsyms_token_index_addr = self.krobase + pos
+                break
+            pos += 1
+        return
+
+    def initialize32_normal_kallsyms_num_syms(self):
+        # 1. next to it
+        self.kallsyms_num_syms_addr = self.kallsyms_relative_base_addr + 0x4
+        self.kallsyms_num_syms_off = self.kallsyms_relative_base_off + 1
+        self.kallsyms_num_syms = self.RO_REGION_u32[self.kallsyms_num_syms_off]
+        return
+
+    def initialize32_normal_kallsyms_names(self):
+        # 1. next to it
+        self.kallsyms_names_addr = self.kallsyms_num_syms_addr + 0x4
+        self.kallsyms_names_off = self.kallsyms_num_syms_off + 1
+        return
+
+    def initialize32_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU(self):
+        # 1. prev to it
+        # 2. if the MSB of the element is on, then it is pattern 4 at kallsyms_sym_address() in root/kernel/kallsyms.c.
+        #    so not pattern 2, therefore, CONFIG_KALLSYMS_ABSOLUTE_PERCPU = True
+        pos = self.kallsyms_relative_base_off - 4
+        self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU = (((self.RO_REGION_u32[pos] >> 31) & 1) == 1)
+        return
+
+    def initialize32_normal_kallsyms_offsets(self):
+        # 1. calc
+        if self.kallsyms_relative_base is None:
+            self.kallsyms_offsets_addr = self.kallsyms_num_syms_addr - self.kallsyms_num_syms * 4
+        else:
+            self.kallsyms_offsets_addr = self.kallsyms_relative_base_addr - self.kallsyms_num_syms * 4
+        return
+
+    def initialize32_normal_kallsyms_markers(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_names_off
+        while True:
+            if self.RO_REGION_u32[pos] == 0: # search kallsyms_markers
+                self.kallsyms_markers_off = pos
+                self.kallsyms_markers_addr = self.krobase + pos * 4 # need not align
+                break
+            pos += 1
+        return
+
+    def initialize32_normal_kallsyms_token_table(self):
+        # 1. walk to next until specific value
+        # 2. align
+        pos = self.kallsyms_markers_off
+        pos += 1 # skip first zero
+        while True:
+            v = self.RO_REGION_u32[pos]
+            """
+            0xcc7c3ee0:     0x00069468      0x0006a096      0x0006aebe      0x0006baaa
+            0xcc7c3ef0:     0x0006c5b4      0x0006d186      0x0006dc59     [0x005f7366] <-- begining of kallsyms_token_table
+            0xcc7c3f00:     0x00657374      0x61007474      0x7400646e      0x006e6f69      (heuristic: prev_value * 4 < this_value)
+            0xcc7c3f10:     0x66006f66      0x5f656572      0x65735f00      0x656d0074
+            0xcc7c3f20:     0x6474006d      0x005f7200      0x74006354      0x63005f6f
+            """
+            if v == 0 or (v & 0xff000000) > 0 or (self.RO_REGION_u32[pos - 1] > 0 and self.RO_REGION_u32[pos - 1] * 4 < v) :
+                self.kallsyms_token_table_addr = self.krobase + pos * 4 # need not align
+                break
+            pos += 1
+        return
+
+    def initialize32_normal_kallsyms_token_index(self):
+        # 1. walk to next until contiguous zero value. it is end of marker of kallsyms_token_table
+        # 2. align
+        pos = self.kallsyms_token_table_addr - self.krobase
+        while True:
+            if self.RO_REGION[pos] == 0 and self.RO_REGION[pos + 1] == 0:
+                pos += 1
+                while pos % 4: # need align
+                    pos += 1
+                self.kallsyms_token_index_addr = self.krobase + pos
+                break
+            pos += 1
+        return
+
+    def initialize64_kallsyms_relative_base(self):
+        # 1. find kbase from rodata
+        for idx, tmp in enumerate(self.RO_REGION_u64[:-1]):
+            if tmp & 0xffff: # kbase should be aligned
+                continue
+            if (tmp & 0xfffffffffff00000) != (self.kbase & 0xfffffffffff00000): # the candidate holds around kbase (usually just kbase)
+                continue
+            if self.RO_REGION_u64[idx + 1] > 0x4ffff: # next element is kallsyms_num_syms. too large number is fail
+                continue
+            self.kallsyms_relative_base = tmp
+            self.kallsyms_relative_base_off = idx
+            self.kallsyms_relative_base_addr = self.krobase + self.kallsyms_relative_base_off * 8
+            return
+        if not self.silent:
+            err("Failed to identified kallsyms_relative_base (not found kernel_base in kernel_robase)")
+        self.kallsyms_relative_base = None
+        self.kallsyms_relative_base_off = None
+        self.kallsyms_relative_base_addr = None
+        return
+
+    def initialize64_sparse_kallsyms_num_syms(self):
+        # 1. next to it (256 bytes aligned)
+        self.kallsyms_num_syms_addr = self.kallsyms_relative_base_addr + 0x100
+        self.kallsyms_num_syms_off = self.kallsyms_relative_base_off + 32
+        self.kallsyms_num_syms = self.RO_REGION_u64[self.kallsyms_num_syms_off]
+        return
+
+    def initialize64_sparse_kallsyms_names(self):
+        # 1. next to it (256 bytes aligned)
+        self.kallsyms_names_addr = self.kallsyms_num_syms_addr + 0x100
+        self.kallsyms_names_off = self.kallsyms_num_syms_off + 32
+        return
+
+    def initialize64_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU(self):
+        # 1. walk to prev and found non-zero value
+        # 2. if the MSB of the element is on, then it is pattern 4 at kallsyms_sym_address() in root/kernel/kallsyms.c.
+        #    so not pattern 2, therefore, CONFIG_KALLSYMS_ABSOLUTE_PERCPU = True
+        # pos = self.kallsyms_relative_base_off * 2 # from u64 pos to u32 pos
+        pos = self.kallsyms_relative_base_off * 2 - 4 # from u64 pos to u32 pos
+        while self.RO_REGION_u32[pos] == 0:
+            pos -= 1
+        self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU = (((self.RO_REGION_u32[pos] >> 31) & 1) == 1)
+        return
+
+    def initialize64_sparse_kallsyms_offsets(self):
+        # 1. calc
+        if self.kallsyms_relative_base is None:
+            self.kallsyms_offsets_addr = self.kallsyms_num_syms_addr - self.kallsyms_num_syms * 8
+        else:
+            self.kallsyms_offsets_addr = self.kallsyms_relative_base_addr - self.kallsyms_num_syms * 4
+        self.kallsyms_offsets_addr &= ~0xff # 256 bytes aligned
+        return
+
+    def initialize64_sparse_kallsyms_markers(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_names_off
+        while True:
+            if self.RO_REGION_u64[pos] == 0 and pos % 32 == 0:
+                self.kallsyms_markers_off = pos
+                self.kallsyms_markers_addr = self.krobase + pos * 8
+                break
+            pos += 1
+        return
+
+    def initialize64_sparse_kallsyms_token_table(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_markers_off
+        while True: # use pos above
+            v = self.RO_REGION_u64[pos]
+            if v & 0xffffffffff000000 > 0 or (self.RO_REGION_u64[pos - 1] > 0 and self.RO_REGION_u64[pos - 1] * 4 < v):
+                self.kallsyms_token_table_addr = self.krobase + pos * 8
+                break
+            pos += 32
+        return
+
+    def initialize64_sparse_kallsyms_token_index(self):
+        # 1. walk to next until contiguous zero value. it is end of marker of kallsyms_token_table
+        # 2. align
+        pos = self.kallsyms_token_table_addr - self.krobase
+        while True:
+            if self.RO_REGION[pos] == 0 and self.RO_REGION[pos + 1] == 0:
+                pos += 1
+                while pos % 256: # need align
+                    pos += 1
+                self.kallsyms_token_index_addr = self.krobase + pos
+                break
+            pos += 1
+        return
+
+    def initialize64_normal_kallsyms_num_syms(self):
+        # 1. next to it
+        self.kallsyms_num_syms_addr = self.kallsyms_relative_base_addr + 0x8
+        self.kallsyms_num_syms_off = self.kallsyms_relative_base_off + 1
+        self.kallsyms_num_syms = self.RO_REGION_u64[self.kallsyms_num_syms_off]
+
+        return
+
+    def initialize64_normal_kallsyms_names(self):
+        # 1. next to it
+        self.kallsyms_names_addr = self.kallsyms_num_syms_addr + 0x8
+        self.kallsyms_names_off = self.kallsyms_num_syms_off + 1
+        return
+
+    def initialize64_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU(self):
+        # 1. prev to it
+        # 2. if the MSB of the element is on, then it is pattern 4 at kallsyms_sym_address() in root/kernel/kallsyms.c.
+        #    so not pattern 2, therefore, CONFIG_KALLSYMS_ABSOLUTE_PERCPU = True
+        # pos = self.kallsyms_relative_base_off * 2 # from u64 pos to u32 pos
+        pos = self.kallsyms_relative_base_off * 2 - 4 # from u64 pos to u32 pos
+        self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU = (((self.RO_REGION_u32[pos] >> 31) & 1) == 1)
+
+        return
+
+    def initialize64_normal_kallsyms_offsets(self):
+        # 1. calc
+        # 2. align
+        if self.kallsyms_relative_base is None:
+            self.kallsyms_offsets_addr = self.kallsyms_num_syms_addr - self.kallsyms_num_syms * 8
+        else:
+            self.kallsyms_offsets_addr = self.kallsyms_relative_base_addr - self.kallsyms_num_syms * 4  
+        self.kallsyms_offsets_addr &= ~0x7
+        return
+
+    def initialize64_normal_kallsyms_markers(self):
+        # 1. walk to next until zero value
+        # 2. align
+        pos = self.kallsyms_names_off * 2 - 4 # needs twice to use RO_REGION_u32
+        while True:
+            if self.RO_REGION_u32[pos] == 0: # search kallsyms_markers
+                while pos % 2: # need align
+                    pos += 1
+                self.kallsyms_markers_off = pos
+                self.kallsyms_markers_addr = self.krobase + pos * 4
+                break
+            pos += 2
+        return
+
+    def initialize64_normal_kallsyms_token_table(self):
+        # 1. check array type is u32 or u64
+        # 2. walk to next until specific value
+        # 3. align
+        pos = self.kallsyms_markers_off
+        if self.RO_REGION_u32[pos] == 0 and self.RO_REGION_u32[pos + 1] == 0: # u64 mode
+            if self.meta:
+                info("u64 mode at initialize64_normal_kallsyms_token_table")
+            """
+                0xffffffff987aaf80:     0x0000000000086329      0x000000000008724d
+                0xffffffff987aaf90:     0x3131323038656565 *    0x6572007365725f00
+                0xffffffff987aafa0:     0x65735f0074736967      0x6c6261005f360074
+                0xffffffff987aafb0:     0x656565006c660065      0x2e00656b00647400
+            """
+            pos = pos // 2 + 1 # skip first zero
+            while True:
+                if self.RO_REGION_u64[pos] == 0 or (self.RO_REGION_u64[pos] & 0xffffffffff000000) > 0:
+                    self.kallsyms_token_table_addr = self.krobase + pos * 8
+                    break
+                pos += 1
+        else: # u32 mode
+            if self.meta:
+                info("u32 mode at initialize64_normal_kallsyms_token_table")
+            """
+            [pattern 1 krce]
+                0xffffffffbd101840:     0x000595e8      0x0005a026      0x0005a966      0x00000000
+                0xffffffffbd101850:     0x00686361 *    0x00706572      0x63007674      0x00636568
+                0xffffffffbd101860:     0x7465735f      0x34367800      0x0079735f      0x00343678
+                0xffffffffbd101870:     0x00726f63      0x66006354      0x6900726f      0x74005f63
+            [pattern 2 poe]
+                0xffffffff9a866400:     0x0010c631      0x0010d091      0x0010db64      0x0010e677
+                0xffffffff9a866410:     0x0010f0f2      0x00000000      0x00646e61 *    0x61727474
+                0xffffffff9a866420:     0x005f6563      0x69676572      0x72657473      0x6f74005f
+                0xffffffff9a866430:     0x332e005f      0x6e696600      0x74786500      0x78005f34
+            [pattern 3 own buildroot]
+                0xffffffff9d0e9dd0:     0x000506f3      0x00051205      0x00051dfc      0x000529fc
+                0xffffffff9d0e9de0:     0x0005354d      0x00053fdc      0x00054a51      0x000554e1
+                0xffffffff9d0e9df0:     0x6c006563 *    0x62740061      0x00767400      0x7465735f
+                0xffffffff9d0e9e00:     0x666e6900      0x676e6900      0x006c6f00      0x00726f66
+            [pattern 4 kone_gadget]
+                0xffffffff81cfbff0:     0x00056381      0x00056f2b      0x00057a59      0x00058451
+                0xffffffff81cfc000:     0x00058ebd      0x0005994f      0x00686361 *    0x7465735f
+                0xffffffff81cfc010:     0x65686300      0x6f630063      0x76740072      0x70657200
+                0xffffffff81cfc020:     0x726f6600      0x34367800      0x0079735f      0x00343678
+            """
+            # pos += 1 # skip first zero
+            # pos += 2 # we want to use (pos, pos-1, pos-2), so avoid bug
+            pos_u8 = pos * 4
+            probs = 0
+            is_null_byte = False
+            len_symbol = 0
+            num_symbols = 0
+            symbol_name = ""
+
+            while True:
+                for i in range(4):
+                    pos_u8 += 1
+
+
+                    if self.RO_REGION[pos_u8] in [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 95, 46, 63]:
+                        probs += 1
+                        len_symbol += 1
+                        is_null_byte = False
+                        symbol_name += chr(self.RO_REGION[pos_u8])
+                    elif is_null_byte == False and self.RO_REGION[pos_u8] == 0 and probs != 0:
+                        is_null_byte = True
+                        probs += 1
+                        num_symbols += 1
+                        symbol_name = ""
+                    else:
+                        is_null_byte = True
+                        probs = 0
+                        num_symbols = 0
+                        symbol_name = ""
+
+                    if num_symbols > 100:
+                        offset = (pos_u8-probs+1) & ~0x7
+                        self.kallsyms_token_table_addr = self.krobase + offset
+                        return
+
+                diff1 = self.RO_REGION_u32[pos - 1] - self.RO_REGION_u32[pos - 2]
+                diff2 = self.RO_REGION_u32[pos - 0] - self.RO_REGION_u32[pos - 1]
+
+                # if diff1 * 100 < diff2: # pattern 3, 4
+                #     self.kallsyms_token_table_addr = self.krobase + pos * 4
+                #     # break
+
+                # pos += 1
+        return
+
+    def initialize64_normal_kallsyms_token_index(self):
+        # 1. walk to next until contiguous zero value. it is end of marker of kallsyms_token_table
+        # 2. align
+        pos = self.kallsyms_token_table_addr - self.krobase
+        while True:
+            if self.RO_REGION[pos] == 0 and self.RO_REGION[pos + 1] == 0:
+                pos += 1
+                while pos % 8: # need align
+                    pos += 1
+                self.kallsyms_token_index_addr = self.krobase + pos
+                break
+            pos += 1
+        return
+
+    def initialize32_kallsyms_num_syms_2(self):
+        # 1. walk next
+        # because used aboslute value, similar addresses are lined up
+        # 0xc1940888:     0xc1000000      0xc1000000      0xc10000bc      0xc10000cc
+        # 0xc1940898:     0xc10000ed      0xc1000165      0xc10001e7      0xc1000239
+        # ...
+        # 0xc198f0ac:     0xc1e85000      0xc1e95000      0xc1e9b000      0xc1e9b000
+        # 0xc198f0bc:     0x00013a0d <- kallsyms_num_syms_addr
+        pos = self.kallsyms_relative_base_off
+        while True:
+            val = self.RO_REGION_u32[pos]
+            if val != 0 and (val >> 20) == 0:
+                self.kallsyms_num_syms_addr = self.krobase + pos * 4
+                self.kallsyms_num_syms_off = pos
+                self.kallsyms_num_syms = val
+                break
+            pos += 1
+        return
+
+    def initialize64_kallsyms_num_syms_2(self):
+        # 1. walk next
+        # because used aboslute value, similar addresses are lined up
+        pos = self.kallsyms_relative_base_off
+        while True:
+            val = self.RO_REGION_u64[pos]
+            if val != 0 and (val >> 32) == 0:
+                self.kallsyms_num_syms_addr = self.krobase + pos * 8
+                self.kallsyms_num_syms_off = pos
+                self.kallsyms_num_syms = val
+                break
+            pos += 1
+        return
+
+    def initialize32(self):
+        self.RO_REGION = read_memory(self.krobase, self.krobase_size)
+        self.RO_REGION_u32 = [u32(self.RO_REGION[i:i + 4]) for i in range(0, len(self.RO_REGION), 4)]
+        self.initialize32_kallsyms_relative_base()
+
+        if self.kallsyms_relative_base_off is None:
+            return None
+
+        # rare case (maybe no kASLR kernel)
+        if self.RO_REGION_u32[self.kallsyms_relative_base_off + 1] == self.RO_REGION_u32[self.kallsyms_relative_base_off]:
+            self.initialize32_kallsyms_num_syms_2() # common to sparse and normal
+            # do not use kallsyms_relative_base, use absolute value
+            self.kallsyms_relative_base = None
+            if self.RO_REGION_u32[self.kallsyms_num_syms_off + 1] == 0: # sparse mode (rare case)
+                if self.meta:
+                    info("does not detect relative_base. treat as sparse mode (rare case)")
+                # all variables placed as 16 bytes aligned
+                self.initialize32_sparse_kallsyms_names()
+                self.initialize32_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+                self.initialize32_sparse_kallsyms_offsets()
+                self.initialize32_sparse_kallsyms_markers()
+                self.initialize32_sparse_kallsyms_token_table()
+                self.initialize32_sparse_kallsyms_token_index()
+            else: # normal mode (rare case)
+                if self.meta:
+                    info("does not detect relative_base, treat as normal mode (rare case)")
+                self.initialize32_normal_kallsyms_names()
+                self.initialize32_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+                self.initialize32_normal_kallsyms_offsets()
+                self.initialize32_normal_kallsyms_markers()
+                self.initialize32_normal_kallsyms_token_table()
+                self.initialize32_normal_kallsyms_token_index()
+        elif self.RO_REGION_u32[self.kallsyms_relative_base_off + 1] == 0: # sparse mode
+            if self.meta:
+                info("detect relative_base, treat as sparse mode")
+            # all variables placed as 16 bytes aligned
+            self.initialize32_sparse_kallsyms_num_syms()
+            self.initialize32_sparse_kallsyms_names()
+            self.initialize32_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+            self.initialize32_sparse_kallsyms_offsets()
+            self.initialize32_sparse_kallsyms_markers()
+            self.initialize32_sparse_kallsyms_token_table()
+            self.initialize32_sparse_kallsyms_token_index()
+        else: # normal mode
+            if self.meta:
+                info("detect relative_base, treat as normal mode")
+            self.initialize32_normal_kallsyms_num_syms()
+            self.initialize32_normal_kallsyms_names()
+            self.initialize32_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+            self.initialize32_normal_kallsyms_offsets()
+            self.initialize32_normal_kallsyms_markers()
+            self.initialize32_normal_kallsyms_token_table()
+            self.initialize32_normal_kallsyms_token_index()
         return True
+
+    def initialize64(self):
+        self.RO_REGION = read_memory(self.krobase, self.krobase_size)
+        self.RO_REGION_u64 = [u64(self.RO_REGION[i:i + 8]) for i in range(0, len(self.RO_REGION), 8)]
+        self.RO_REGION_u32 = [u32(self.RO_REGION[i:i + 4]) for i in range(0, len(self.RO_REGION), 4)]
+        self.initialize64_kallsyms_relative_base()
+
+        if self.RO_REGION_u64[self.kallsyms_relative_base_off + 1] == self.RO_REGION_u64[self.kallsyms_relative_base_off]: # rare case
+            self.initialize64_kallsyms_num_syms_2() # common to sparse and normal
+            # do not use kallsyms_relative_base, use absolute value
+            self.kallsyms_relative_base = None
+            if self.RO_REGION_u64[self.kallsyms_num_syms_off + 1] == 0: # sparse mode (rare case)
+                if self.meta:
+                    info("does not detect relative_base, treat as sparse mode (rare case)")
+                # all variables placed as 256 bytes aligned
+                self.initialize64_sparse_kallsyms_names()
+                self.initialize64_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+                self.initialize64_sparse_kallsyms_offsets()
+                self.initialize64_sparse_kallsyms_markers()
+                self.initialize64_sparse_kallsyms_token_table()
+                self.initialize64_sparse_kallsyms_token_index()
+            else: # normal mode (rare case)
+                if self.meta:
+                    info("does not detect relative_base, treat as normal mode (rare case)")
+                self.initialize64_normal_kallsyms_names()
+                self.initialize64_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+                self.initialize64_normal_kallsyms_offsets()
+                self.initialize64_normal_kallsyms_markers()
+                self.initialize64_normal_kallsyms_token_table()
+                self.initialize64_normal_kallsyms_token_index()
+        elif self.RO_REGION_u64[self.kallsyms_relative_base_off + 1] == 0: # sparse mode
+            if self.meta:
+                info("detect relative_base, treat as sparse mode")
+            # all variables placed as 256 bytes aligned
+            self.initialize64_sparse_kallsyms_num_syms()
+            self.initialize64_sparse_kallsyms_names()
+            self.initialize64_sparse_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+            self.initialize64_sparse_kallsyms_offsets()
+            self.initialize64_sparse_kallsyms_markers()
+            self.initialize64_sparse_kallsyms_token_table()
+            self.initialize64_sparse_kallsyms_token_index()
+        else: # normal mode
+            if self.meta:
+                info("detect relative_base, treat as normal mode")
+            self.initialize64_normal_kallsyms_num_syms()
+            self.initialize64_normal_kallsyms_names()
+            self.initialize64_normal_CONFIG_KALLSYMS_ABSOLUTE_PERCPU()
+            self.initialize64_normal_kallsyms_offsets()
+            self.initialize64_normal_kallsyms_markers()
+            self.initialize64_normal_kallsyms_token_table()
+            self.initialize64_normal_kallsyms_token_index()
+        return True
+
+    def print_meta(self, force=False):
+        if self.meta or force:
+            try:
+                info("kernel_base:            {:#x}".format(self.kbase)) # to search kallsyms_*
+                info("kernel_robase:          {:#x}".format(self.krobase)) # to search kallsyms_*
+                if self.kallsyms_relative_base:
+                    info("kallsyms_relative_base: {:#x}: {:#x}".format(self.kallsyms_relative_base_addr, self.kallsyms_relative_base))
+                    info("kallsyms_num_syms:      {:#x}: {:#x}".format(self.kallsyms_num_syms_addr, self.kallsyms_num_syms))
+                    gdb.execute("x/4x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_relative_base_addr))
+                else:
+                    info("kallsyms_relative_base: None")
+                    info("kallsyms_num_syms:      {:#x}: {:#x}".format(self.kallsyms_num_syms_addr, self.kallsyms_num_syms))
+                    gdb.execute("x/4x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_num_syms_addr))
+                info("kallsyms_names          {:#x}".format(self.kallsyms_names_addr)) # to lookup symbol
+                gdb.execute("x/8x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_names_addr - 0x10))
+                info("CONFIG_KALLSYMS_ABSOLUTE_PERCPU: {:d}".format(self.CONFIG_KALLSYMS_ABSOLUTE_PERCPU)) # to calculate address
+                info("kallsyms_offsets:       {:#x}".format(self.kallsyms_offsets_addr)) # to lookup symbol
+                gdb.execute("x/8x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_offsets_addr - 0x10))
+                info("kallsyms_markers:       {:#x}".format(self.kallsyms_markers_addr)) # to search kallsyms_*
+                gdb.execute("x/8x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_markers_addr - 0x10))
+                info("kallsyms_token_table:   {:#x}".format(self.kallsyms_token_table_addr)) # to calculate address
+                gdb.execute("x/8x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_token_table_addr - 0x10))
+                info("kallsyms_token_index:   {:#x}".format(self.kallsyms_token_index_addr)) # to calculate address
+                gdb.execute("x/8x{} {}".format(["w", "g"][is_64bit()], self.kallsyms_token_index_addr - 0x10))
+            except Exception:
+                pass
+        return
+
+    def initialize(self):
+        if self.initialized:
+            self.print_meta()
+            return True
+        # get kernel memory maps
+        if not self.silent:
+            info("Wait for memory scan")
+        kinfo = KernelbaseCommand.get_kernel_base()
+        if kinfo.has_none:
+            err("Failed to resolve")
+            return None
+        self.maps = kinfo.maps
+        self.kbase = kinfo.kbase
+        self.kbase_size = kinfo.kbase_size
+        self.krobase = kinfo.krobase
+        self.krobase_size = kinfo.krobase_size
+        # resolve some address
+        if is_32bit():
+            res = self.initialize32()
+        elif is_64bit():
+            res = self.initialize64()
+
+        if res:
+            # prepare each byte array
+            if self.kallsyms_relative_base is None:
+                r = self.RO_REGION[self.kallsyms_offsets_addr - self.krobase: self.kallsyms_num_syms_addr - self.krobase]
+                if is_64bit():
+                    self.kallsyms_offsets = [u64(r[i:i + 8]) for i in range(0, len(r), 8)] # unsigned 64bit
+                else:
+                    self.kallsyms_offsets = [u32(r[i:i + 4]) for i in range(0, len(r), 4)] # unsigned 32bit
+            else:
+                r = self.RO_REGION[self.kallsyms_offsets_addr - self.krobase: self.kallsyms_relative_base_addr - self.krobase]
+                self.kallsyms_offsets = [u32(r[i:i + 4], s=True) for i in range(0, len(r), 4)] # signed 32bit
+
+            r = self.RO_REGION[self.kallsyms_names_addr - self.krobase: self.kallsyms_markers_addr - self.krobase]
+            self.kallsyms_names = [u8(r[i:i + 1]) for i in range(0, len(r), 1)] # 8bit
+            r = self.RO_REGION[self.kallsyms_token_table_addr - self.krobase: self.kallsyms_token_index_addr - self.krobase]
+            self.kallsyms_token_table = [u8(r[i:i + 1]) for i in range(0, len(r), 1)] # 8bit
+            r = self.RO_REGION[self.kallsyms_token_index_addr - self.krobase:] # fixed table size
+            self.kallsyms_token_index = [u16(r[i:i + 2]) for i in range(0, len(r), 2)] # 16bit
+            self.initialized = True
+        # finish
+        self.print_meta()
+        return True if res else False
 
     @parse_args
     @only_if_gdb_running
     @only_if_qemu_system
+    @only_if_specific_arch(arch=["x86_32", "x86_64", "ARM32", "ARM64"])
     def do_invoke(self, args):
         self.dont_repeat()
 
-        self.verbose = args.verbose
-        self.quiet = args.quiet
+        self.meta = args.meta
+        self.silent = args.silent
         self.exact = args.exact
-        if args.reparse:
-            self.kallsyms = []
+        self.head = args.head
+        self.print_all = args.print_all
+        if args.keyword == []:
+            self.print_all = True
 
-        if self.kallsyms == []:
-            self.quiet_info("Wait for memory scan")
-            kinfo = KernelbaseCommand.get_kernel_base()
-            if kinfo.has_none:
-                self.quiet_err("Failed to resolve")
-                return
-            self.krobase = kinfo.krobase
-            self.krobase_size = kinfo.krobase_size
-
-            self.kernel_img = read_memory(self.krobase, self.krobase_size)
-            ret = self.initialize()
-            if not ret:
-                return
-
+        if not self.initialize():
+            return
         self.resolve_kallsyms()
         self.print_kallsyms(args.keyword)
         return
@@ -42861,7 +41280,7 @@ class VmlinuxToElfApplyCommand(GenericCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('--reparse', action='store_true',
-                        help='force applying vmlinux-to-elf again. (default: reuse if vmlinux-to-elf-dump-memory.elf exists)')
+                        help='force applying vmlinux-to-elf again. (default: reuse if vmlinux-to-elf-dump-memory.elf exists')
     _syntax_ = parser.format_help()
 
     @staticmethod
@@ -42975,10 +41394,7 @@ class VmlinuxToElfApplyCommand(GenericCommand):
         symboled_vmlinux_file = os.path.join(GEF_TEMP_DIR, "vmlinux-to-elf-dump-memory.elf")
         kinfo = self.dump_kernel_elf(dumped_mem_file, symboled_vmlinux_file, force=args.reparse)
         if kinfo is None:
-            err("Failed to create kernel ELF. try to re-parse...")
-            kinfo = self.dump_kernel_elf(dumped_mem_file, symboled_vmlinux_file, force=True)
-        if kinfo is None:
-            err("Failed to create kernel ELF.")
+            err("Failed to create kernel ELF")
             return
 
         # load symbol
@@ -44830,6 +43246,7 @@ class MuslDumpCommand(GenericCommand):
 
         # iterate __malloc_context.active
         for idx in range(48):
+            print(idx)
             if self.active_idx is not None and idx != self.active_idx:
                 continue
             current = ctx.active[idx]
@@ -45325,11 +43742,11 @@ class OpteeThreadEnterUserModeBreakpoint(gdb.Breakpoint):
     @staticmethod
     def get_ta_loaded_address():
         if is_arm32():
-            res = get_maps_by_pagewalk("pagewalk -q -S -n")
+            res = get_maps_by_pagewalk("pagewalk -q -S")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "PL0/R-X" in line, res))
         elif is_arm64():
-            res = get_maps_by_pagewalk("pagewalk 1 -q -n")
+            res = get_maps_by_pagewalk("pagewalk 1 -q")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "EL0/R-X" in line, res))
         maps = []
@@ -45443,11 +43860,11 @@ class OpteeBgetDumpCommand(GenericCommand):
 
     def is_readable_virt_memory(self, addr):
         if is_arm32():
-            res = get_maps_by_pagewalk("pagewalk -q -S -n")
+            res = get_maps_by_pagewalk("pagewalk -q -S")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "PL0/RW-" in line, res))
         elif is_arm64():
-            res = get_maps_by_pagewalk("pagewalk 1 -q -n")
+            res = get_maps_by_pagewalk("pagewalk 1 -q")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "EL0/RW-" in line, res))
         for line in res:
@@ -45675,7 +44092,7 @@ class CpuidCommand(GenericCommand):
 
     _example_ = "{:s}\n".format(_cmdline_)
     _example_ += "\n"
-    _example_ += "DISABLE `-enbale-kvm` option for qemu-system; This command will be aborted if the option is set"
+    _example_ += "DISABLE `-enable-kvm` option for qemu-system; This command will be aborted if the option is set"
 
     def get_state(self, code_len):
         d = {}
@@ -46557,7 +44974,6 @@ class MsrCommand(GenericCommand):
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-l', dest='filter', nargs='*', help='list up known MSR values.')
     group.add_argument('msr_target', metavar='MSR_VALUE|MSR_NAME', nargs='?', help='the msr value/name you want to know real value.')
-    parser.add_argument('-q', '--quiet', action='store_true', help='quiet mode.')
     _syntax_ = parser.format_help()
 
     _example_ = "{:s} 0xc0000080              # rcx value\n".format(_cmdline_)
@@ -46565,7 +44981,7 @@ class MsrCommand(GenericCommand):
     _example_ += "{:s} -l                      # list up known MSR const values\n".format(_cmdline_)
     _example_ += "{:s} -l MSR_EFER MSR_GS_BASE # show specified MSR const value\n".format(_cmdline_)
     _example_ += "\n"
-    _example_ += "DISABLE `-enbale-kvm` option for qemu-system; This command will be aborted if the option is set"
+    _example_ += "DISABLE `-enable-kvm` option for qemu-system; This command will be aborted if the option is set"
 
     msr_table = [
         ["MSR_EFER",                         0xc0000080, "Extended feature register"],
@@ -47048,17 +45464,20 @@ class MsrCommand(GenericCommand):
         return "Unknown"
 
     def print_const_table(self, filt):
-        gef_print(titlify("MSR const table"))
-        fmt = "{:34s}: {:10s} : {:s}"
+        gef_print(titlify("MSR table"))
+        fmt = "{:60s}: {:20s} : {:s}"
         legend = ["Name", "Value", "Description"]
         gef_print(Color.colorify(fmt.format(*legend), get_gef_setting("theme.table_heading")))
         for name, val, desc in self.msr_table:
+            name = f"{name} ({val:#010x})"
             if filt == []:
-                gef_print("{:34s}: {:#010x} : {:s}".format(name, val, desc))
+                val = self.read_msr_core(val)
+                gef_print("{:60s}: {:#020x} : {:s}".format(name, val, desc))
                 continue
             for f in filt:
                 if f in name:
-                    gef_print("{:34s}: {:#010x} : {:s}".format(name, val, desc))
+                    val = self.read_msr_core(val)
+                    gef_print("{:60s}: {:#020x} : {:s}".format(name, val, desc))
         return
 
     def bits_split(self, x, bits=64):
@@ -47115,7 +45534,7 @@ class MsrCommand(GenericCommand):
         os.close(self.stdout_bak)
         return
 
-    def read_msr(self, num):
+    def read_msr_core(self, num):
         code = b"\xeb\xfe\x0f\x32" # inf-loop (to stop another thread); rdmsr
         gef_on_stop_unhook(hook_stop_handler)
         d = self.get_state(len(code))
@@ -47134,13 +45553,19 @@ class MsrCommand(GenericCommand):
         gef_on_stop_hook(hook_stop_handler)
         return ((edx << 32) | eax) & 0xffffffffffffffff
 
+    def read_msr(self, num):
+        val = self.read_msr_core(num)
+        name = self.lookup_val2name(num)
+        gef_print("{:s} ({:#x}): {:#x} (={:s})".format(name, num, val, self.bits_split(val)))
+        return
+
     @parse_args
     @only_if_gdb_running
     @only_if_specific_arch(arch=["x86_32", "x86_64"])
     def do_invoke(self, args):
         self.dont_repeat()
 
-        if args.filter:
+        if args.msr_target == None:
             self.print_const_table(args.filter)
             return
 
@@ -47153,17 +45578,11 @@ class MsrCommand(GenericCommand):
         num = self.lookup_name2val(args.msr_target)
         if num is None:
             try:
-                num = int(args.target, 0)
-            except Exception:
+                num = int(args.msr_target, 16)
+            except Exception as e:
                 self.usage()
                 return
-
-        val = self.read_msr(num)
-        name = self.lookup_val2name(num)
-        if args.quiet:
-            gef_print("{:#x}".format(val))
-        else:
-            gef_print("{:s} ({:#x}): {:#x} (={:s})".format(name, num, val, self.bits_split(val)))
+        self.read_msr(num)
         return
 
 
@@ -47295,6 +45714,7 @@ class PrintBitInfo:
         self.print_description()
         self.print_bitinfo(regval)
         return
+
 
 
 @register_command
@@ -47560,7 +45980,7 @@ class QemuRegistersCommand(GenericCommand):
             else:
                 s = GdtInfoCommand.segval2str(b)
             gef_print("[{:02d}] {:20s}: {:s} {:s}".format(i, segname_info[i], s, Color.colorify(reglist, registers_color)))
-        info("more info, use `gdtinfo -v` command, it prints legend of GDT entry")
+        info("for more info, use `gdtinfo -v` command, it prints legend of GDT entry")
 
         # IDTR
         gef_print(titlify("IDTR (Interrupt Descriptor Table Register)"))
@@ -47569,6 +45989,8 @@ class QemuRegistersCommand(GenericCommand):
         gef_print("{:s} = {:s}:{:s}".format(red("IDTR"), yellow("{:#x}".format(base)), yellow("{:#x}".format(limit))))
         gef_print("base : {:s}: starting address of IDT (Interrupt Descriptor Table)".format(Color.boldify("{:#x}".format(base))))
         gef_print("limit: {:s}: (size of IDT) - 1".format(Color.boldify("{:#x}".format(limit))))
+
+        info("for more info, use `int -v` command, it prints every current IDT entry".format(Color.boldify("EXAMPLE")))
 
         # LDTR
         gef_print(titlify("LDTR (Local Descriptor Table Register)"))
@@ -47720,14 +46142,14 @@ class V2PCommand(GenericCommand):
             if FORCE_PREFIX_S is True:
                 return get_maps_arm64_optee_secure_memory(verbose) # already parsed
             else:
-                res = get_maps_by_pagewalk("pagewalk 1 -q --no-merge -n")
+                res = get_maps_by_pagewalk("pagewalk 1 -q --no-merge")
         else:
             if FORCE_PREFIX_S is None:
-                res = get_maps_by_pagewalk("pagewalk -q --no-merge -n")
+                res = get_maps_by_pagewalk("pagewalk -q --no-merge")
             elif FORCE_PREFIX_S is True:
-                res = get_maps_by_pagewalk("pagewalk -q --no-merge -S -n")
+                res = get_maps_by_pagewalk("pagewalk -q --no-merge -S")
             elif FORCE_PREFIX_S is False:
-                res = get_maps_by_pagewalk("pagewalk -q --no-merge -s -n")
+                res = get_maps_by_pagewalk("pagewalk -q --no-merge -s")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -47849,29 +46271,21 @@ class PagewalkCommand(GenericCommand):
         self.cache[key] = out
         return out
 
-    def add_out(self, msg):
-        self.out.append(msg)
+    def gef_print(self, msg):
+        if self.use_pager:
+            self.out.append(msg)
+        gef_print(msg)
         return
 
     def quiet_info(self, msg):
         if not self.quiet:
             msg = "{} {}".format(Color.colorify("[+]", "bold blue"), msg)
-            self.add_out(msg)
+            self.gef_print(msg)
         return
 
-    def warn(self, msg):
-        msg = "{} {}".format(Color.colorify("[+]", "bold yellow"), msg)
-        self.add_out(msg)
-        return
-
-    def err(self, msg):
-        msg = "{} {}".format(Color.colorify("[+]", "bold red"), msg)
-        self.add_out(msg)
-        return
-
-    def quiet_add_out(self, msg):
+    def quiet_gef_print(self, msg):
         if not self.quiet:
-            self.add_out(msg)
+            self.gef_print(msg)
         return
 
     # merge pages that points same phys page
@@ -47885,52 +46299,19 @@ class PagewalkCommand(GenericCommand):
     #    virt: 0xffffffff111f7000  -> phys;0xabcd000
     # they will be merged by "*". type is changed from int to string.
     #    virt:"0xffffffff111*7000" -> phys:0xabcd000
-    def merge1(self, mappings):
+    def merge1(self):
         # group entries that refer to the same phys page
         tmp = {}
-        for entry in mappings: # [virt_addr, phys_addr, page_size, page_count, flags]
+        for entry in self.mappings: # [virt_addr, phys_addr, page_size, page_count, flags]
             va, other = entry[0], tuple(entry[1:])
             if other not in tmp:
                 tmp[other] = []
-            tmp[other].append(va)
-
-        # internal merge function
-        def recursive_merge(d):
-            if d == {}:
-                return [""]
-            out = []
-            if len(d) == 16:
-                tmp = list(d.values())
-                if tmp.count(tmp[0]) == 16:
-                    for vv in recursive_merge(tmp[0]):
-                        out.append("*" + vv)
-                    return out
-            for k, v in d.items():
-                for vv in recursive_merge(v):
-                    out.append(k + vv)
-            return out
+            tmp[other].append("{:016x}".format(va))
 
         # merge if possible
         merged_mappings = []
         for other, va_array in tmp.items():
-
-            # usually go through this path
-            if len(va_array) < 16:
-                for va in va_array:
-                    merged_mappings.append(["{:016x}".format(va)] + list(other))
-                continue
-
-            # fast path for x64
-            if len(va_array) == 0x10000:
-                va_sorted = sorted([x >> 16 for x in va_array])
-                if va_sorted[0] + 0xffff == va_sorted[-1]:
-                    new_va_str = "{:016x}".format(va_array[0])
-                    new_va_str = new_va_str[:8] + "****" + new_va_str[12:]
-                    merged_mappings.append([new_va_str] + list(other))
-                    continue
-
-            # slow path
-            queue = ["{:016x}".format(x) for x in va_array]
+            queue = va_array
             # extract
             dic = {}
             for q in queue:
@@ -47944,17 +46325,33 @@ class PagewalkCommand(GenericCommand):
                     dst[q[i]] = src
 
             # merge
+            def recursive_merge(d):
+                if d == {}:
+                    return [""]
+                out = []
+                if len(d) == 16:
+                    tmp = list(d.values())
+                    if tmp.count(tmp[0]) == 16:
+                        for vv in recursive_merge(tmp[0]):
+                            out.append("*" + vv)
+                        return out
+                for k, v in d.items():
+                    for vv in recursive_merge(v):
+                        out.append(k + vv)
+                return out
+
             for d in recursive_merge(dic):
                 merged_mappings.append([d] + list(other))
 
         # done
-        return sorted(merged_mappings)
+        self.mappings = sorted(merged_mappings)
+        return
 
     # merge consecutive pages
-    def merge2(self, mappings):
+    def merge2(self):
         merged_mappings = []
         prev = None
-        for now in mappings: # [virt_addr_string, phys_addr, page_size, page_count, flags]
+        for now in self.mappings: # [virt_addr_string, phys_addr, page_size, page_count, flags]
 
             # specific case
             if "*" in now[0]:
@@ -48004,11 +46401,12 @@ class PagewalkCommand(GenericCommand):
         if prev:
             merged_mappings += [prev]
 
-        return merged_mappings
+        self.mappings = merged_mappings
+        return
 
-    def vrange_filter(self, mappings):
+    def vrange_filter(self):
         filtered_mappings = []
-        for mapping in mappings:
+        for mapping in self.mappings:
             va, _, size, cnt = mapping[:4]
             if isinstance(va, str) and "*" in va:
                 start = int(va.replace("*", "0"), 16)
@@ -48024,11 +46422,12 @@ class PagewalkCommand(GenericCommand):
                     if va <= addr < va + size * cnt:
                         filtered_mappings.append(mapping)
                         break
-        return sorted(filtered_mappings)
+        self.mappings = sorted(filtered_mappings)
+        return
 
-    def prange_filter(self, mappings):
+    def prange_filter(self):
         filtered_mappings = []
-        for mapping in mappings:
+        for mapping in self.mappings:
             _, pa, size, cnt = mapping[:4]
             if isinstance(pa, str):
                 pa = int(pa, 16)
@@ -48036,7 +46435,8 @@ class PagewalkCommand(GenericCommand):
                 if pa <= addr < pa + size * cnt:
                     filtered_mappings.append(mapping)
                     break
-        return sorted(filtered_mappings)
+        self.mappings = sorted(filtered_mappings)
+        return
 
     def format_legend(self):
         fmt = "{:33s}  {:33s}  {:12s} {:11s} {:6s} {:s}"
@@ -48069,39 +46469,35 @@ class PagewalkCommand(GenericCommand):
                 text = fmt.format(va, vend, pa, pend, size * cnt, size, cnt, flags)
         return text
 
-    def merging(self):
+    def print_page(self):
+        if len(self.mappings) == 0:
+            warn("No virtual mappings found")
+            return
+
         self.mappings = sorted(self.mappings)
 
         # merging
         if self.no_merge:
             pass
         else:
-            self.mappings = self.merge1(self.mappings)
+            self.merge1()
             self.quiet_info("PT Entry (merged similar pages that refer the same physpage): {:d}".format(len(self.mappings)))
-            self.mappings = self.merge2(self.mappings)
+            self.merge2()
             self.quiet_info("PT Entry (merged consecutive pages): {:d}".format(len(self.mappings)))
-        return
-
-    def make_out(self, mappings):
-        if len(mappings) == 0:
-            self.warn("No virtual mappings found")
-            return
-
-        filtered_mappings = mappings.copy()
 
         # filter by virtual address range
         if self.vrange != []:
-            filtered_mappings = self.vrange_filter(filtered_mappings)
-            self.quiet_info("PT Entry (filtered by virtual address range): {:d}".format(len(filtered_mappings)))
+            self.vrange_filter()
+            self.quiet_info("PT Entry (filtered by virtual address range): {:d}".format(len(self.mappings)))
 
         # filter by physical address range
         if self.prange != []:
-            filtered_mappings = self.prange_filter(filtered_mappings)
-            self.quiet_info("PT Entry (filtered by physical address range): {:d}".format(len(filtered_mappings)))
+            self.prange_filter()
+            self.quiet_info("PT Entry (filtered by physical address range): {:d}".format(len(self.mappings)))
 
         # create output
         lines = []
-        for entry_info in filtered_mappings:
+        for entry_info in self.mappings:
             line = self.format_entry(entry_info)
             lines.append(line)
 
@@ -48122,13 +46518,20 @@ class PagewalkCommand(GenericCommand):
 
         # check how many result
         if lines == []:
-            self.warn("Nothing to display")
+            warn("Nothing to display")
             return
 
-        # add out
-        self.out.append(titlify("Memory map"))
-        self.out.append(Color.colorify(self.format_legend(), get_gef_setting("theme.table_heading")))
-        self.out.extend(lines)
+        # print
+        if self.use_pager:
+            self.out.append(titlify("Memory map"))
+            self.out.append(Color.colorify(self.format_legend(), get_gef_setting("theme.table_heading")))
+            self.out.extend(lines)
+        else:
+            out = self.out.copy()
+            out.append(titlify("Memory map"))
+            out.append(Color.colorify(self.format_legend(), get_gef_setting("theme.table_heading")))
+            out.extend(lines)
+            gef_print('\n'.join(out))
         return
 
     def is_not_trace_target(self, va_start, va_end):
@@ -48173,7 +46576,7 @@ class PagewalkX64Command(PagewalkCommand):
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-q', dest='quiet', action='store_true', help='show result only.')
-    parser.add_argument('--print-each-level', action='store_true', help='show all level pagetables.')
+    parser.add_argument('-v', '--print-each_level', action='store_true', help='show all level pagetables.')
     parser.add_argument('--no-merge', action='store_true', help='do not merge similar/consecutive address.')
     parser.add_argument('--sort-by-phys', action='store_true', help='sort by physical address.')
     parser.add_argument('--simple', action='store_true', help='merge with ignoring physical address consecutivness.')
@@ -48184,13 +46587,11 @@ class PagewalkX64Command(PagewalkCommand):
                         help='filter by map included specified physical address.')
     parser.add_argument('--trace', metavar='VADDR', default=[], action='append', type=lambda x: int(x, 16),
                         help='show all level pagetables only associated specified address.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
-    parser.add_argument('-c', '--use-cache', action='store_true', help='use before result.')
+    parser.add_argument('-p', '--use-pager', action='store_true', help='use pager (less).')
     _syntax_ = parser.format_help()
 
     def __init__(self):
         super().__init__(prefix=False)
-        self.mappings = None
         return
 
     def format_flags(self, flag_info):
@@ -48216,7 +46617,7 @@ class PagewalkX64Command(PagewalkCommand):
         return ' '.join(flags)
 
     def pagewalk_PML5T(self):
-        self.quiet_add_out(titlify("PML5E: Page Map Level 5 Entry"))
+        self.quiet_gef_print(titlify("PML5E: Page Map Level 5 Entry"))
         PML5E = []
         COUNT = 0
         for va_base, table_base, parent_flags in self.TABLES:
@@ -48236,6 +46637,7 @@ class PagewalkX64Command(PagewalkCommand):
 
                 # calc flags
                 flags = parent_flags.copy()
+                print(hex(entry))
                 if ((entry >> 1) & 1) == 0:
                     flags.append("NO_RW")
                 if ((entry >> 2) & 1) == 0:
@@ -48261,7 +46663,7 @@ class PagewalkX64Command(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PML5 Entry: {:d}".format(len(PML5E)))
@@ -48270,7 +46672,7 @@ class PagewalkX64Command(PagewalkCommand):
         return
 
     def pagewalk_PML4T(self):
-        self.quiet_add_out(titlify("PML4E: Page Map Level 4 Entry"))
+        self.quiet_gef_print(titlify("PML4E: Page Map Level 4 Entry"))
         PML4E = []
         COUNT = 0
         for va_base, table_base, parent_flags in self.TABLES:
@@ -48319,7 +46721,7 @@ class PagewalkX64Command(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PML4 Entry: {:d}".format(len(PML4E)))
@@ -48328,7 +46730,7 @@ class PagewalkX64Command(PagewalkCommand):
         return
 
     def pagewalk_PDPT(self):
-        self.quiet_add_out(titlify("PDPE: Page Directory Pointer Entry"))
+        self.quiet_gef_print(titlify("PDPE: Page Directory Pointer Entry"))
 
         def is_set_PS(entry):
             return ((entry >> 7) & 1) == 1
@@ -48394,7 +46796,7 @@ class PagewalkX64Command(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PDPT Entry: {:d}".format(len(PDPTE)))
@@ -48405,7 +46807,7 @@ class PagewalkX64Command(PagewalkCommand):
         return
 
     def pagewalk_PDT(self):
-        self.quiet_add_out(titlify("PDE: Page Directory Entry"))
+        self.quiet_gef_print(titlify("PDE: Page Directory Entry"))
 
         def is_set_PS(entry):
             return ((entry >> 7) & 1) == 1
@@ -48447,7 +46849,7 @@ class PagewalkX64Command(PagewalkCommand):
                 elif is_x86_32() and is_set_PS(entry):
                     high = (entry >> 13) & 0xf
                     low = (entry >> 22) & 0x3ff
-                    next_level_table = ((high << 10) | low) << 22
+                    next_level_table = (high << 10) | low
                 else:
                     next_level_table = entry & 0x000ffffffffff000
 
@@ -48476,7 +46878,7 @@ class PagewalkX64Command(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PD Entry: {:d}".format(len(PDE)))
@@ -48487,7 +46889,7 @@ class PagewalkX64Command(PagewalkCommand):
         return
 
     def pagewalk_PT(self):
-        self.quiet_add_out(titlify("PTE: Page Table Entry"))
+        self.quiet_gef_print(titlify("PTE: Page Table Entry"))
         PTE = []
         COUNT = 0
         for va_base, table_base, parent_flags in self.TABLES:
@@ -48536,16 +46938,12 @@ class PagewalkX64Command(PagewalkCommand):
                     line = fmt.format(addr, entry, virt_addr, virt_addr_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PT Entry (4KB): {:d}".format(len(PTE)))
         self.quiet_info("Invalid entries: {:d}".format(COUNT - len(PTE)))
         self.PTE += PTE
-
-        self.quiet_add_out(titlify("Total"))
-        self.quiet_info("PT Entry (Total): {:d}".format(len(self.PTE)))
-        self.mappings = self.PTE
         return
 
     def pagewalk(self):
@@ -48585,14 +46983,11 @@ class PagewalkX64Command(PagewalkCommand):
                     "PML5T_BITS": 9, "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
                 }
                 self.PAE = True
-                if not self.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PML5T()
-                    self.pagewalk_PML4T()
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
+                self.pagewalk_PML5T()
+                self.pagewalk_PML4T()
+                self.pagewalk_PDPT()
+                self.pagewalk_PDT()
+                self.pagewalk_PT()
             else:
                 # 64bit 4-level(4KB): 9,9,9,9,12
                 # 64bit 4-level(2MB): 9,9,9,0,21
@@ -48603,13 +46998,10 @@ class PagewalkX64Command(PagewalkCommand):
                     "PML4T_BITS": 9, "PDPT_BITS": 9, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
                 }
                 self.PAE = True
-                if not self.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PML4T()
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
+                self.pagewalk_PML4T()
+                self.pagewalk_PDPT()
+                self.pagewalk_PDT()
+                self.pagewalk_PT()
         elif is_x86_32():
             if (cr4 >> 5) & 1: # PAE check
                 # 32bit PAE(4KB): 2,9,9,12 (PTE Size: 64bit)
@@ -48620,12 +47012,9 @@ class PagewalkX64Command(PagewalkCommand):
                     "PDPT_BITS": 2, "PDT_BITS": 9, "PT_BITS": 9, "OFFSET": 12,
                 }
                 self.PAE = True
-                if not self.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PDPT()
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
+                self.pagewalk_PDPT()
+                self.pagewalk_PDT()
+                self.pagewalk_PT()
             else:
                 # 32bit(4KB): 10,10,12
                 # 32bit(4MB): 10,0,22
@@ -48635,16 +47024,16 @@ class PagewalkX64Command(PagewalkCommand):
                     "PDT_BITS": 10, "PT_BITS": 10, "OFFSET": 12,
                 }
                 self.PAE = False
-                if not self.use_cache or not self.mappings:
-                    self.mappings = None
-                    self.pagewalk_PDT()
-                    self.pagewalk_PT()
-                    self.merging()
+                self.pagewalk_PDT()
+                self.pagewalk_PT()
         else:
-            self.err("Unsupported")
+            err("Unsupported")
             return
 
-        self.make_out(self.mappings)
+        self.quiet_gef_print(titlify("Total"))
+        self.quiet_info("PT Entry (Total): {:d}".format(len(self.PTE)))
+        self.mappings = self.PTE
+        self.print_page()
         return
 
     @parse_args
@@ -48660,22 +47049,22 @@ class PagewalkX64Command(PagewalkCommand):
         self.sort_by_phys = args.sort_by_phys
         self.simple = args.simple
         self.filter = args.filter
-        self.vrange = args.vrange.copy()
-        self.prange = args.prange.copy()
-        self.trace = args.trace.copy()
-        self.use_cache = args.use_cache
+        self.vrange = args.vrange
+        self.prange = args.prange
+        self.trace = args.trace
         if self.trace:
             self.vrange.extend(self.trace) # also set --vrange
             self.print_each_level = True # overwrite
-            self.use_cache = False # overwrite
-
-        self.out = []
+        self.use_pager = args.use_pager
         self.cache = {}
+
+        self.mappings = None
+        self.out = []
         self.pagewalk()
         self.cache = {}
 
         if self.out:
-            gef_print('\n'.join(self.out), less=not args.no_pager)
+            gef_print('\n'.join(self.out), less=self.use_pager)
         return
 
 
@@ -48691,7 +47080,7 @@ class PagewalkArmCommand(PagewalkCommand):
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-S', dest='force_secure', action='store_true', help='use TTBRn_ELm_S for parsing start register.')
     group.add_argument('-s', dest='force_normal', action='store_true', help='use TTBRn_ELm for parsing start register.')
-    parser.add_argument('--print-each-level', action='store_true', help='show all level pagetables.')
+    parser.add_argument('-v', '--print-each_level', action='store_true', help='show all level pagetables.')
     parser.add_argument('--no-merge', action='store_true', help='do not merge similar/consecutive address.')
     parser.add_argument('--sort-by-phys', action='store_true', help='sort by physical address.')
     parser.add_argument('--simple', action='store_true', help='merge with ignoring physical address consecutivness.')
@@ -48702,14 +47091,11 @@ class PagewalkArmCommand(PagewalkCommand):
                         help='filter by map included specified physical address.')
     parser.add_argument('--trace', metavar='VADDR', default=[], action='append', type=lambda x: int(x, 16),
                         help='show all level pagetables only associated specified address.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
-    parser.add_argument('-c', '--use-cache', action='store_true', help='use before result.')
+    parser.add_argument('-p', '--use-pager', action='store_true', help='use pager (less).')
     _syntax_ = parser.format_help()
 
     def __init__(self):
         super().__init__(prefix=False)
-        self.ttbr0_mappings = None
-        self.ttbr1_mappings = None
         return
 
     def format_flags_short(self, flag_info):
@@ -48934,7 +47320,7 @@ class PagewalkArmCommand(PagewalkCommand):
             return (entry & 0b11) in [0b10, 0b11] and ((entry >> 18) & 1) == 0
 
         def is_super_section(entry):
-            return self.XP and (entry & 0b11) in [0b10, 0b11] and ((entry >> 18) & 1) == 1
+            return (entry & 0b11) in [0b10, 0b11] and ((entry >> 18) & 1) == 1
 
         def is_large_page(entry):
             return (entry & 0b11) == 0b01
@@ -48943,7 +47329,7 @@ class PagewalkArmCommand(PagewalkCommand):
             return (entry & 0b11) in [0b10, 0b11]
 
         # 1st level parse
-        self.quiet_add_out(titlify("LEVEL 1"))
+        self.quiet_gef_print(titlify("LEVEL 1"))
         LEVEL1 = []
         SECTION = []
         SUPER_SECTION = []
@@ -48963,9 +47349,9 @@ class PagewalkArmCommand(PagewalkCommand):
             # calc flags
             flags = []
             if has_next_level(entry):
-                if self.XP and ((entry >> 2) & 1) == 1:
+                if ((entry >> 2) & 1) == 1:
                     flags.append("PXN")
-                if self.XP and ((entry >> 3) & 1) == 1:
+                if ((entry >> 3) & 1) == 1:
                     flags.append("NS")
                 flags.append("domain={:#x}".format((entry >> 5) & 0b1111))
             elif is_section(entry):
@@ -48975,7 +47361,7 @@ class PagewalkArmCommand(PagewalkCommand):
                     flags.append("B")
                 if ((entry >> 3) & 1) == 1:
                     flags.append("C")
-                if self.XP and ((entry >> 4) & 1) == 1:
+                if ((entry >> 4) & 1) == 1:
                     flags.append("XN")
                 flags.append("domain={:#x}".format((entry >> 5) & 0b1111))
                 ap = (((entry >> 15) & 1) << 2) + ((entry >> 10) & 0b11)
@@ -48984,11 +47370,11 @@ class PagewalkArmCommand(PagewalkCommand):
                 else: # AP[2:0] access permissions model
                     flags.append("AP={:03b}".format(ap))
                 flags.append("TEX={:#x}".format((entry >> 12) & 0b111))
-                if self.XP and ((entry >> 16) & 1) == 1:
+                if ((entry >> 16) & 1) == 1:
                     flags.append("S")
-                if self.XP and ((entry >> 17) & 1) == 1:
+                if ((entry >> 17) & 1) == 1:
                     flags.append("nG")
-                if self.XP and ((entry >> 19) & 1) == 1:
+                if ((entry >> 19) & 1) == 1:
                     flags.append("NS")
             elif is_super_section(entry):
                 if ((entry >> 0) & 1) == 1:
@@ -49011,8 +47397,6 @@ class PagewalkArmCommand(PagewalkCommand):
                     flags.append("nG")
                 if ((entry >> 19) & 1) == 1:
                     flags.append("NS")
-            else:
-                raise
 
             # calc next table (drop the flag bits)
             if has_next_level(entry):
@@ -49052,7 +47436,7 @@ class PagewalkArmCommand(PagewalkCommand):
                 line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                 if self.is_not_filter_target(line):
                     continue
-                self.add_out(line)
+                self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("Level 1 Entry: {:d}".format(len(LEVEL1)))
@@ -49062,7 +47446,7 @@ class PagewalkArmCommand(PagewalkCommand):
         self.mappings += SECTION + SUPER_SECTION
 
         # 2nd level parse
-        self.quiet_add_out(titlify("LEVEL 2"))
+        self.quiet_gef_print(titlify("LEVEL 2"))
         LARGE = []
         SMALL = []
         COUNT = 0
@@ -49143,7 +47527,7 @@ class PagewalkArmCommand(PagewalkCommand):
                     line = fmt.format(addr, entry, virt_addr, virt_addr_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PT Entry (large; 64KB): {:d}".format(len(LARGE)))
@@ -49151,7 +47535,7 @@ class PagewalkArmCommand(PagewalkCommand):
         self.quiet_info("Invalid entries: {:d}".format(COUNT - len(LARGE) - len(SMALL)))
         self.mappings += LARGE + SMALL
 
-        self.quiet_add_out(titlify("Total"))
+        self.quiet_gef_print(titlify("Total"))
         self.quiet_info("PT Entry (Total): {:d}".format(len(self.mappings)))
         self.mappings = sorted(self.mappings)
         return
@@ -49168,7 +47552,7 @@ class PagewalkArmCommand(PagewalkCommand):
         def is_2MB_page(entry):
             return (entry & 0b11) == 0b01
 
-        self.quiet_add_out(titlify("LEVEL 1"))
+        self.quiet_gef_print(titlify("LEVEL 1"))
         if self.N < 2:
             # 1st level parse
             LEVEL1 = []
@@ -49240,7 +47624,7 @@ class PagewalkArmCommand(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
             self.quiet_info("Number of entries: {:d}".format(COUNT))
             self.quiet_info("Level 1 Entry: {:d}".format(len(LEVEL1)))
@@ -49253,7 +47637,7 @@ class PagewalkArmCommand(PagewalkCommand):
             LEVEL1 = [[va_base, table_base, flags]]
 
         # 2nd level parse
-        self.quiet_add_out(titlify("LEVEL 2"))
+        self.quiet_gef_print(titlify("LEVEL 2"))
         LEVEL2 = []
         MB = []
         COUNT = 0
@@ -49324,7 +47708,7 @@ class PagewalkArmCommand(PagewalkCommand):
                     line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("Level 2 Entry: {:d}".format(len(LEVEL2)))
@@ -49333,7 +47717,7 @@ class PagewalkArmCommand(PagewalkCommand):
         self.mappings += MB
 
         # 3rd level parse
-        self.quiet_add_out(titlify("LEVEL 3"))
+        self.quiet_gef_print(titlify("LEVEL 3"))
         KB = []
         COUNT = 0
         for va_base, table_base, parent_flags in LEVEL2:
@@ -49385,33 +47769,34 @@ class PagewalkArmCommand(PagewalkCommand):
                     line = fmt.format(addr, entry, virt_addr, virt_addr_end, entry_type, ' '.join(flags))
                     if self.is_not_filter_target(line):
                         continue
-                    self.add_out(line)
+                    self.gef_print(line)
 
         self.quiet_info("Number of entries: {:d}".format(COUNT))
         self.quiet_info("PT Entry (4KB): {:d}".format(len(KB)))
         self.quiet_info("Invalid entries: {:d}".format(COUNT - len(KB)))
         self.mappings += KB
 
-        self.quiet_add_out(titlify("Total"))
+        self.quiet_gef_print(titlify("Total"))
         self.quiet_info("PT Entry (Total): {:d}".format(len(self.mappings)))
         self.mappings = sorted(self.mappings)
         return
 
     def pagewalk_short(self):
-        self.add_out(titlify("$TTBR0_EL1{}".format(self.suffix)))
+        self.gef_print(titlify("$TTBR0_EL1{}".format(self.suffix)))
 
         TTBR0_EL1 = get_register('$TTBR0_EL1{}'.format(self.suffix))
         if TTBR0_EL1 is None:
-            TTBR0_EL1 = get_register('$TTBR0', use_mbed_exec=True)
-        if TTBR0_EL1 is None:
-            self.err('$TTBR0_EL1{} is not found'.format(self.suffix))
+            err('$TTBR0_EL1{} is not found'.format(self.suffix))
+            return
+
+        TTBR1_EL1 = get_register('$TTBR1_EL1{}'.format(self.suffix))
+        if TTBR1_EL1 is None:
+            err('$TTBR1_EL1{} is not found'.format(self.suffix))
             return
 
         TTBCR = get_register('$TTBCR{}'.format(self.suffix))
         if TTBCR is None:
-            TTBCR = get_register('$TTBCR', use_mbed_exec=True)
-        if TTBCR is None:
-            self.err('$TTBCR{} is not found'.format(self.suffix))
+            err('$TTBCR{} is not found'.format(self.suffix))
             return
 
         # pagewalk TTBR0_EL1
@@ -49421,22 +47806,11 @@ class PagewalkArmCommand(PagewalkCommand):
         self.quiet_info("$TTBR0_EL1{}: {:#x}".format(self.suffix, TTBR0_EL1))
         self.quiet_info("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
         self.quiet_info("PL0 base: {:#x}".format(pl0_base))
-        if not self.use_cache or not self.ttbr0_mappings:
-            self.do_pagewalk_short(pl0_base)
-            self.merging()
-            self.ttbr0_mappings = self.mappings.copy()
-        self.make_out(self.ttbr0_mappings)
+        self.do_pagewalk_short(pl0_base)
+        self.print_page()
 
         # pagewalk TTBR1_EL1
-        self.add_out(titlify("$TTBR1_EL1{}".format(self.suffix)))
-
-        TTBR1_EL1 = get_register('$TTBR1_EL1{}'.format(self.suffix))
-        if TTBR1_EL1 is None:
-            TTBR1_EL1 = get_register('$TTBR1', use_mbed_exec=True)
-        if TTBR1_EL1 is None:
-            self.err('$TTBR1_EL1{} is not found'.format(self.suffix))
-            return
-
+        self.gef_print(titlify("$TTBR1_EL1{}".format(self.suffix)))
         if self.suffix:
             pl1_vabase = 0 # I don't know why, but vabase of PL1 seems to be 0x0 when using TTBR1_EL1_S.
         else:
@@ -49451,30 +47825,28 @@ class PagewalkArmCommand(PagewalkCommand):
             self.quiet_info("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
             self.quiet_info("PL1 base: {:#x}".format(pl1_base))
             self.quiet_info("PL1 va_base: {:#x}".format(pl1_vabase))
-            if not self.use_cache or not self.ttbr1_mappings:
-                self.do_pagewalk_short(pl1_base, pl1_vabase)
-                self.merging()
-                self.ttbr1_mappings = self.mappings.copy()
-            self.make_out(self.ttbr1_mappings)
+            self.do_pagewalk_short(pl1_base, pl1_vabase)
+            self.print_page()
         else:
             self.quiet_info("$TTBR1_EL1{} is unused".format(self.suffix))
         return
 
     def pagewalk_long(self):
-        self.add_out(titlify("$TTBR0_EL1{}".format(self.suffix)))
+        self.gef_print(titlify("$TTBR0_EL1{}".format(self.suffix)))
 
         TTBR0_EL1 = get_register('$TTBR0_EL1{}'.format(self.suffix))
         if TTBR0_EL1 is None:
-            TTBR0_EL1 = get_register('$TTBR0', use_mbed_exec=True)
-        if TTBR0_EL1 is None:
-            self.err('$TTBR0_EL1{} is not found'.format(self.suffix))
+            err('$TTBR0_EL1{} is not found'.format(self.suffix))
+            return
+
+        TTBR1_EL1 = get_register('$TTBR1_EL1{}'.format(self.suffix))
+        if TTBR1_EL1 is None:
+            err('$TTBR1_EL1{} is not found'.format(self.suffix))
             return
 
         TTBCR = get_register('$TTBCR{}'.format(self.suffix))
         if TTBCR is None:
-            TTBCR = get_register('$TTBCR', use_mbed_exec=True)
-        if TTBCR is None:
-            self.err('$TTBCR{} is not found'.format(self.suffix))
+            err('$TTBCR{} is not found'.format(self.suffix))
             return
 
         # pagewalk TTBR0_EL1
@@ -49485,22 +47857,11 @@ class PagewalkArmCommand(PagewalkCommand):
         self.quiet_info("$TTBR0_EL1{}: {:#x}".format(self.suffix, TTBR0_EL1))
         self.quiet_info("$TTBCR{}: {:#x}".format(self.suffix, TTBCR))
         self.quiet_info("PL0 base: {:#x}".format(pl0_base))
-        if not self.use_cache or not self.ttbr0_mappings:
-            self.do_pagewalk_long(pl0_base)
-            self.merging()
-            self.ttbr0_mappings = self.mappings.copy()
-        self.make_out(self.ttbr0_mappings)
+        self.do_pagewalk_long(pl0_base)
+        self.print_page()
 
         # pagewalk TTBR1_EL1
-        self.add_out(titlify("$TTBR1_EL1{}".format(self.suffix)))
-
-        TTBR1_EL1 = get_register('$TTBR1_EL1{}'.format(self.suffix))
-        if TTBR1_EL1 is None:
-            TTBR1_EL1 = get_register('$TTBR1', use_mbed_exec=True)
-        if TTBR1_EL1 is None:
-            self.err('$TTBR1_EL1{} is not found'.format(self.suffix))
-            return
-
+        self.gef_print(titlify("$TTBR1_EL1{}".format(self.suffix)))
         if T0SZ != 0 or T1SZ != 0:
             self.N = T1SZ
             pl1_base = TTBR1_EL1 & ((1 << 40) - 1)
@@ -49511,86 +47872,56 @@ class PagewalkArmCommand(PagewalkCommand):
             self.quiet_info("$TTBR1_EL1{}: {:#x}".format(self.suffix, TTBR1_EL1))
             self.quiet_info("PL1 base: {:#x}".format(pl1_base))
             self.quiet_info("PL1 va_base: {:#x}".format(pl1_vabase))
-            if not self.use_cache or not self.ttbr1_mappings:
-                self.do_pagewalk_long(pl1_base, pl1_vabase)
-                self.merging()
-                self.ttbr1_mappings = self.mappings.copy()
-            self.make_out(self.ttbr1_mappings)
+            self.do_pagewalk_long(pl1_base, pl1_vabase)
+            self.print_page()
         else:
             self.quiet_info("$TTBR1_EL1{} is unused".format(self.suffix))
         return
 
     def pagewalk(self):
-        # check use the register with`_S` suffix or not, and Seucre mode or not
+        res = gdb.execute("info registers", to_string=True)
+        if "TTBR" not in res:
+            err("Not found system registers. Check qemu version (at least: 3.x~, recommend: 5.x~).")
+            return
+
+        # check Secure mode
         if self.FORCE_PREFIX_S is None:
             # auto detect
-            SCR_S = get_register('$SCR_S')
-            SCR = get_register('$SCR')
-
-            if (SCR, SCR_S) == (None, None):
-                SCR = get_register('$SCR', use_mbed_exec=True)
-                if SCR is not None:
-                    self.SECURE = (SCR & 0x1) == 0 # NS bit
-                else:
-                    self.SECURE = False
-                self.suffix = ""
-
-            elif SCR is not None and SCR_S is None:
-                # do not use "_S"
+            SCR = get_register('$SCR_S')
+            if SCR is None:
+                SCR = get_register('$SCR')
+            if SCR is not None:
                 self.SECURE = (SCR & 0x1) == 0 # NS bit
-                self.suffix = ""
-
-            elif SCR is None and SCR_S is not None:
-                # use "_S"
-                self.SECURE = (SCR_S & 0x1) == 0 # NS bit
-                self.suffix = "_S"
-
-            elif SCR is not None and SCR_S is not None:
-                r = gdb.execute("monitor info mtree -f", to_string=True)
-                if "virt.secure-ram" in r:
-                    # do not use "_S"
-                    self.SECURE = (SCR & 0x1) == 0 # NS bit
-                    self.suffix = ""
-                else:
-                    # use "_S"
-                    self.SECURE = (SCR_S & 0x1) == 0 # NS bit
-                    self.suffix = "_S"
-
+            else:
+                self.SECURE = False
+            self.suffix = "_S" if self.SECURE else ""
         elif self.FORCE_PREFIX_S is True:
             # use "_S"
-            SCR_S = get_register('$SCR_S')
-            if SCR_S is not None:
-                self.SECURE = (SCR_S & 0x1) == 0 # NS bit
+            SCR = get_register('$SCR_S')
+            if SCR is not None:
+                self.SECURE = (SCR & 0x1) == 0 # NS bit
             else:
                 self.SECURE = False
             self.suffix = "_S"
-
         elif self.FORCE_PREFIX_S is False:
             # do not use "_S"
-            SCR = get_register('$SCR', use_mbed_exec=True)
+            SCR = get_register('$SCR')
             if SCR is not None:
                 self.SECURE = (SCR & 0x1) == 0 # NS bit
             else:
                 self.SECURE = False
             self.suffix = ""
+        self.quiet_info("Secure world: {}".format(self.SECURE))
 
-        # check XP, AFE
-        SCTLR = get_register('$SCTLR{}'.format(self.suffix), use_mbed_exec=True)
+        # check AFE
+        SCTLR = get_register('$SCTLR{}'.format(self.suffix))
         if SCTLR is not None:
-            self.XP = ((SCTLR >> 23) & 0x1) == 1
             self.AFE = ((SCTLR >> 29) & 0x1) == 1
         else:
-            self.XP = False
             self.AFE = False
 
-        if not self.XP:
-            self.quiet_info("VMSAv6 subpages is enabled")
-            self.SECURE = False
-        else:
-            self.quiet_info("Secure world: {}".format(self.SECURE))
-
         # check enabled LPAE
-        TTBCR = get_register('$TTBCR{}'.format(self.suffix), use_mbed_exec=True)
+        TTBCR = get_register('$TTBCR{}'.format(self.suffix))
         if TTBCR is not None:
             self.LPAE = ((TTBCR >> 31) & 0x1) == 1
             self.PTE_SIZE = 8 if self.LPAE else 4
@@ -49598,7 +47929,7 @@ class PagewalkArmCommand(PagewalkCommand):
             self.LPAE = False
 
         # check PXN supported
-        ID_MMFR0 = get_register('$ID_MMFR0{}'.format(self.suffix), use_mbed_exec=True)
+        ID_MMFR0 = get_register('$ID_MMFR0{}'.format(self.suffix))
         if ID_MMFR0 is not None:
             self.PXN = ((ID_MMFR0 >> 2) & 0x1) == 1
         else:
@@ -49638,22 +47969,22 @@ class PagewalkArmCommand(PagewalkCommand):
         self.sort_by_phys = args.sort_by_phys
         self.simple = args.simple
         self.filter = args.filter
-        self.vrange = args.vrange.copy()
-        self.prange = args.prange.copy()
-        self.trace = args.trace.copy()
-        self.use_cache = args.use_cache
+        self.vrange = args.vrange
+        self.prange = args.prange
+        self.trace = args.trace
         if self.trace:
             self.vrange.extend(self.trace) # also set --vrange
             self.print_each_level = True # overwrite
-            self.use_cache = False # overwrite
-
-        self.out = []
+        self.use_pager = args.use_pager
         self.cache = {}
+
+        self.mappings = None
+        self.out = []
         self.pagewalk()
         self.cache = {}
 
         if self.out:
-            gef_print('\n'.join(self.out), less=not args.no_pager)
+            gef_print('\n'.join(self.out), less=self.use_pager)
         return
 
 
@@ -49666,7 +47997,7 @@ class PagewalkArm64Command(PagewalkCommand):
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument('-q', dest='quiet', action='store_true', help='show result only.')
     parser.add_argument("target_el", metavar='TARGET_EL', nargs='?', type=int, help='target EL. (default: current EL)')
-    parser.add_argument('--print-each-level', action='store_true', help='show all level pagetables.')
+    parser.add_argument('-v', '--print-each_level', action='store_true', help='show all level pagetables.')
     parser.add_argument('--no-merge', action='store_true', help='do not merge similar/consecutive address.')
     parser.add_argument('--sort-by-phys', action='store_true', help='sort by physical address.')
     parser.add_argument('--simple', action='store_true', help='merge with ignoring physical address consecutivness.')
@@ -49677,8 +48008,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         help='filter by map included specified physical address.')
     parser.add_argument('--trace', metavar='VADDR', default=[], action='append', type=lambda x: int(x, 16),
                         help='show all level pagetables only associated specified address.')
-    parser.add_argument('-n', '--no-pager', action='store_true', help='do not use less.')
-    parser.add_argument('-c', '--use-cache', action='store_true', help='use before result.')
+    parser.add_argument('-p', '--use-pager', action='store_true', help='use pager (less).')
     _syntax_ = parser.format_help()
 
     # If you want to dump the secure world memory map, you need to break in the secure world.
@@ -49688,12 +48018,6 @@ class PagewalkArm64Command(PagewalkCommand):
 
     def __init__(self):
         super().__init__(prefix=False)
-        self.ttbr0el1_mappings = None
-        self.ttbr1el1_mappings = None
-        self.ttbr0el2_mappings = None
-        self.ttbr1el2_mappings = None
-        self.vttbrel2_mappings = None
-        self.ttbr0el3_mappings = None
         return
 
     def read_mem_wrapper(self, addr, size=8):
@@ -50053,7 +48377,7 @@ class PagewalkArm64Command(PagewalkCommand):
             self.OFFSET_BIT_RANGE = [0, 16]
         else:
             if not self.silent:
-                self.err("Unsupported granule_bits")
+                err("Unsupported granule_bits")
             return
 
         if not self.silent:
@@ -50092,7 +48416,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # level -1 parse for 4KB granule
         if not self.silent:
-            self.quiet_add_out(titlify("LEVEL -1"))
+            self.quiet_gef_print(titlify("LEVEL -1"))
         if self.LEVELM1_BIT_RANGE is not None and start_level == -1:
             entries_per_table = get_entries_per_table(self.LEVELM1_BIT_RANGE)
             LEVELM1 = []
@@ -50157,7 +48481,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                         if self.is_not_filter_target(line):
                             continue
-                        self.add_out(line)
+                        self.gef_print(line)
 
             if not self.silent:
                 self.quiet_info("Number of entries: {:d}".format(COUNT))
@@ -50171,7 +48495,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # level 0 parse for 4KB/16KB granule
         if not self.silent:
-            self.quiet_add_out(titlify("LEVEL 0"))
+            self.quiet_gef_print(titlify("LEVEL 0"))
         if self.LEVEL0_BIT_RANGE is not None and start_level <= 0:
             entries_per_table = get_entries_per_table(self.LEVEL0_BIT_RANGE)
             LEVEL0 = []
@@ -50304,7 +48628,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                         if self.is_not_filter_target(line):
                             continue
-                        self.add_out(line)
+                        self.gef_print(line)
 
             if not self.silent:
                 self.quiet_info("Number of entries: {:d}".format(COUNT))
@@ -50319,7 +48643,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # level 1 parse for 4KB/16KB/64KB granule
         if not self.silent:
-            self.quiet_add_out(titlify("LEVEL 1"))
+            self.quiet_gef_print(titlify("LEVEL 1"))
         if self.LEVEL1_BIT_RANGE is not None and start_level <= 1:
             entries_per_table = get_entries_per_table(self.LEVEL1_BIT_RANGE)
             LEVEL1 = []
@@ -50465,7 +48789,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                         if self.is_not_filter_target(line):
                             continue
-                        self.add_out(line)
+                        self.gef_print(line)
 
             if not self.silent:
                 self.quiet_info("Number of entries: {:d}".format(COUNT))
@@ -50482,7 +48806,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # level 2 parse for 4KB/16KB/64KB granule
         if not self.silent:
-            self.quiet_add_out(titlify("LEVEL 2"))
+            self.quiet_gef_print(titlify("LEVEL 2"))
         if self.LEVEL2_BIT_RANGE is not None and start_level <= 2:
             entries_per_table = get_entries_per_table(self.LEVEL2_BIT_RANGE)
             LEVEL2 = []
@@ -50628,7 +48952,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         line = fmt.format(addr, entry, new_va, new_va_end, entry_type, ' '.join(flags))
                         if self.is_not_filter_target(line):
                             continue
-                        self.add_out(line)
+                        self.gef_print(line)
 
             if not self.silent:
                 self.quiet_info("Number of entries: {:d}".format(COUNT))
@@ -50645,7 +48969,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # level 3 parse for 4KB/16KB/64KB granule
         if not self.silent:
-            self.quiet_add_out(titlify("LEVEL 3"))
+            self.quiet_gef_print(titlify("LEVEL 3"))
         if self.LEVEL3_BIT_RANGE is not None and start_level <= 3:
             entries_per_table = get_entries_per_table(self.LEVEL3_BIT_RANGE)
             KB4 = []
@@ -50770,7 +49094,7 @@ class PagewalkArm64Command(PagewalkCommand):
                         line = fmt.format(addr, entry, virt_addr, virt_addr_end, entry_type, ' '.join(flags))
                         if self.is_not_filter_target(line):
                             continue
-                        self.add_out(line)
+                        self.gef_print(line)
 
             if not self.silent:
                 self.quiet_info("Number of entries: {:d}".format(COUNT))
@@ -50785,7 +49109,7 @@ class PagewalkArm64Command(PagewalkCommand):
 
         # Finalize
         if not self.silent:
-            self.quiet_add_out(titlify("Total"))
+            self.quiet_gef_print(titlify("Total"))
             self.quiet_info("PT Entry (Total): {:d}".format(len(self.mappings)))
         self.mappings = sorted(self.mappings)
         return
@@ -50797,7 +49121,7 @@ class PagewalkArm64Command(PagewalkCommand):
         # change EL
         try:
             if self.TargetEL < 1 or self.TargetEL > 3:
-                self.err("Invalid argument (ELx>=1 && ELx<=3)")
+                err("Invalid argument (ELx>=1 && ELx<=3)")
                 return
             if self.TargetEL != CurrentEL:
                 self.SAVED_CPSR = CPSR
@@ -50806,10 +49130,10 @@ class PagewalkArm64Command(PagewalkCommand):
                 gdb.parse_and_eval('$cpsr = 0x%08x' % CPSR)
                 self.quiet_info('Moving to EL%d' % (self.TargetEL))
         except ValueError:
-            self.err("Invalid argument (ELx integer required)")
+            err("Invalid argument (ELx integer required)")
             return
         except gdb.error:
-            self.err("Maybe unsupported to change to EL%d" % (self.TargetEL))
+            err("Maybe unsupported to change to EL%d" % (self.TargetEL))
             return
         # reload CPSR
         CPSR = get_register('$cpsr') & 0xffffffff
@@ -50825,12 +49149,12 @@ class PagewalkArm64Command(PagewalkCommand):
         return
 
     def pagewalk_TTBR0_EL1(self):
-        self.add_out(titlify("$TTBR0_EL1"))
+        self.gef_print(titlify("$TTBR0_EL1"))
 
         TTBR0_EL1 = get_register('$TTBR0_EL1')
         TCR_EL1 = get_register('$TCR_EL1')
         if TTBR0_EL1 == 0:
-            self.warn("Maybe unused TTBR0_EL1")
+            warn("Maybe unused TTBR0_EL1")
             return
 
         IPS = (TCR_EL1 >> 32) & 0b111
@@ -50839,7 +49163,7 @@ class PagewalkArm64Command(PagewalkCommand):
         try:
             granule_bits = {0b00: 12, 0b01: 16, 0b10: 14}[TG0]
         except Exception:
-            self.err("Unsupported $TCR_EL1.TG0")
+            err("Unsupported $TCR_EL1.TG0")
             return
         region_start = 0
         region_end = region_start + (2 ** (64 - T0SZ))
@@ -50851,7 +49175,7 @@ class PagewalkArm64Command(PagewalkCommand):
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR0_EL1 & 0xffffffffffc0) | (((TTBR0_EL1 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and IPS pair")
+                err("Unsupported FEAT_LPA and IPS pair")
                 return
         else:
             translation_base_addr = TTBR0_EL1 & 0xfffffffffffe
@@ -50863,20 +49187,17 @@ class PagewalkArm64Command(PagewalkCommand):
         self.quiet_info('EL1 User Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.ttbr0el1_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=True)
-            self.merging()
-            self.ttbr0el1_mappings = self.mappings.copy()
-        self.make_out(self.ttbr0el1_mappings)
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=True)
+        self.print_page()
         return
 
     def pagewalk_TTBR1_EL1(self):
-        self.add_out(titlify("$TTBR1_EL1"))
+        self.gef_print(titlify("$TTBR1_EL1"))
 
         TTBR1_EL1 = get_register('$TTBR1_EL1')
         TCR_EL1 = get_register('$TCR_EL1')
         if TTBR1_EL1 == 0:
-            self.warn("Maybe unused TTBR1_EL1")
+            warn("Maybe unused TTBR1_EL1")
             return
 
         IPS = (TCR_EL1 >> 32) & 0b111
@@ -50885,7 +49206,7 @@ class PagewalkArm64Command(PagewalkCommand):
         try:
             granule_bits = {0b01: 14, 0b10: 12, 0b11: 16}[TG1]
         except Exception:
-            self.err("Unsupported $TCR_EL1.TG1")
+            err("Unsupported $TCR_EL1.TG1")
             return
         region_end = 2 ** 64
         region_start = region_end - (2 ** (64 - T1SZ))
@@ -50897,7 +49218,7 @@ class PagewalkArm64Command(PagewalkCommand):
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR1_EL1 & 0xffffffffffc0) | (((TTBR1_EL1 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and IPS pair")
+                err("Unsupported FEAT_LPA and IPS pair")
                 return
         else:
             translation_base_addr = TTBR1_EL1 & 0xfffffffffffe
@@ -50909,22 +49230,19 @@ class PagewalkArm64Command(PagewalkCommand):
         self.quiet_info('EL1 Kernel Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.ttbr1el1_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=True)
-            self.merging()
-            self.ttbr1el1_mappings = self.mappings.copy()
-        self.make_out(self.ttbr1el1_mappings)
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=True)
+        self.print_page()
         return
 
     def pagewalk_VTTBR_EL2(self):
         if not self.silent:
-            self.add_out(titlify("$VTTBR_EL2"))
+            self.gef_print(titlify("$VTTBR_EL2"))
 
         VTTBR_EL2 = get_register('$VTTBR_EL2')
         VTCR_EL2 = get_register('$VTCR_EL2')
         if VTTBR_EL2 == 0:
             if not self.silent:
-                self.warn("Maybe unused VTTBR_EL2")
+                warn("Maybe unused VTTBR_EL2")
             return
 
         SL2 = (VTCR_EL2 >> 33) & 0b1
@@ -50936,7 +49254,7 @@ class PagewalkArm64Command(PagewalkCommand):
             granule_bits = {0b00: 12, 0b01: 16, 0b10: 14}[TG0]
         except Exception:
             if not self.silent:
-                self.err("Unsupported $VTCR_EL2.TG0")
+                err("Unsupported $VTCR_EL2.TG0")
             return
         region_start = 0
         region_end = region_start + (2 ** (64 - T0SZ))
@@ -50957,7 +49275,7 @@ class PagewalkArm64Command(PagewalkCommand):
                 if TG0 == 0b00:
                     if self.FEAT_LPA2 and SL2 == 1:
                         if not self.silent:
-                            self.err("Unsupported stage2 start level")
+                            err("Unsupported stage2 start level")
                         return
                     else:
                         stage2_start_level = 1
@@ -50967,7 +49285,7 @@ class PagewalkArm64Command(PagewalkCommand):
                 if TG0 == 0b00:
                     if self.FEAT_LPA2 and SL2 == 1:
                         if not self.silent:
-                            self.err("Unsupported stage2 start level")
+                            err("Unsupported stage2 start level")
                         return
                     else:
                         stage2_start_level = 0
@@ -50977,7 +49295,7 @@ class PagewalkArm64Command(PagewalkCommand):
                 if TG0 == 0b00:
                     if self.FEAT_LPA2 and SL2 == 1:
                         if not self.silent:
-                            self.err("Unsupported stage2 start level")
+                            err("Unsupported stage2 start level")
                         return
                     else:
                         stage2_start_level = 3
@@ -51001,7 +49319,7 @@ class PagewalkArm64Command(PagewalkCommand):
                     stage2_start_level = 1
             else:
                 if not self.silent:
-                    self.err("Unsupported stage2 start level")
+                    err("Unsupported stage2 start level")
                 return
 
         if PS == 0b110:
@@ -51009,7 +49327,7 @@ class PagewalkArm64Command(PagewalkCommand):
                 translation_base_addr = (VTTBR_EL2 & 0xffffffffffc0) | (((VTTBR_EL2 >> 2) & 0b1111) << 48)
             else:
                 if not self.silent:
-                    self.err("Unsupported FEAT_LPA and PS pair")
+                    err("Unsupported FEAT_LPA and PS pair")
                 return
         else:
             translation_base_addr = VTTBR_EL2 & 0xfffffffffffe
@@ -51023,23 +49341,18 @@ class PagewalkArm64Command(PagewalkCommand):
             self.quiet_info('EL2 Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.vttbrel2_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start, start_level=stage2_start_level, is_stage2=True)
-            if not self.silent:
-                self.merging()
-                self.vttbrel2_mappings = self.mappings.copy()
-
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start, start_level=stage2_start_level, is_stage2=True)
         if not self.silent:
-            self.make_out(self.vttbrel2_mappings)
+            self.print_page()
         return
 
     def pagewalk_TTBR0_EL2(self):
-        self.add_out(titlify("$TTBR0_EL2"))
+        self.gef_print(titlify("$TTBR0_EL2"))
 
         TTBR0_EL2 = get_register('$TTBR0_EL2')
         TCR_EL2 = get_register('$TCR_EL2')
         if TTBR0_EL2 == 0:
-            self.warn("Maybe unused TTBR0_EL2")
+            warn("Maybe unused TTBR0_EL2")
             return
 
         if self.EL2_E2H:
@@ -51051,7 +49364,7 @@ class PagewalkArm64Command(PagewalkCommand):
         try:
             granule_bits = {0b00: 12, 0b01: 16, 0b10: 14}[TG0]
         except Exception:
-            self.err("Unsupported $TCR_EL2.TG0")
+            err("Unsupported $TCR_EL2.TG0")
             return
         region_start = 0
         region_end = region_start + (2 ** (64 - T0SZ))
@@ -51066,13 +49379,13 @@ class PagewalkArm64Command(PagewalkCommand):
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR0_EL2 & 0xffffffffffc0) | (((TTBR0_EL2 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and PS pair")
+                err("Unsupported FEAT_LPA and PS pair")
                 return
         elif self.EL2_E2H and IPS == 0b110:
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR0_EL2 & 0xffffffffffc0) | (((TTBR0_EL2 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and IPS pair")
+                err("Unsupported FEAT_LPA and IPS pair")
                 return
         else:
             translation_base_addr = TTBR0_EL2 & 0xfffffffffffe
@@ -51091,20 +49404,17 @@ class PagewalkArm64Command(PagewalkCommand):
             self.quiet_info('EL2 Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.ttbr1el2_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=self.EL2_M20)
-            self.merging()
-            self.ttbr1el2_mappings = self.mappings.copy()
-        self.make_out(self.ttbr1el2_mappings)
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=self.EL2_M20)
+        self.print_page()
         return
 
     def pagewalk_TTBR1_EL2(self):
-        self.add_out(titlify("$TTBR1_EL2"))
+        self.gef_print(titlify("$TTBR1_EL2"))
 
         TTBR1_EL2 = get_register('$TTBR1_EL2')
         TCR_EL2 = get_register('$TCR_EL2')
         if TTBR1_EL2 == 0:
-            self.warn("Maybe unused TTBR1_EL2")
+            warn("Maybe unused TTBR1_EL2")
             return
 
         IPS = (TCR_EL2 >> 32) & 0b111
@@ -51113,7 +49423,7 @@ class PagewalkArm64Command(PagewalkCommand):
         try:
             granule_bits = {0b01: 14, 0b10: 12, 0b11: 16}[TG1]
         except Exception:
-            self.err("Unsupported $TCR_EL2.TG1")
+            err("Unsupported $TCR_EL2.TG1")
             return
         region_end = 2 ** 64
         region_start = region_end - (2 ** (64 - T1SZ))
@@ -51125,7 +49435,7 @@ class PagewalkArm64Command(PagewalkCommand):
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR1_EL2 & 0xffffffffffc0) | (((TTBR1_EL2 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and IPS pair")
+                err("Unsupported FEAT_LPA and IPS pair")
                 return
         else:
             translation_base_addr = TTBR1_EL2 & 0xfffffffffffe
@@ -51137,20 +49447,17 @@ class PagewalkArm64Command(PagewalkCommand):
         self.quiet_info('EL2 Kernel Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.ttbr1el2_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=self.EL2_M20)
-            self.merging()
-            self.ttbr1el2_mappings = self.mappings.copy()
-        self.make_out(self.ttbr1el2_mappings)
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start, is_2VAranges=self.EL2_M20)
+        self.print_page()
         return
 
     def pagewalk_TTBR0_EL3(self):
-        self.add_out(titlify("$TTBR0_EL3"))
+        self.gef_print(titlify("$TTBR0_EL3"))
 
         TTBR0_EL3 = get_register('$TTBR0_EL3')
         TCR_EL3 = get_register('$TCR_EL3')
         if TTBR0_EL3 == 0:
-            self.warn("Maybe unused TTBR0_EL3")
+            warn("Maybe unused TTBR0_EL3")
             return
 
         PS = (TCR_EL3 >> 16) & 0b111
@@ -51159,7 +49466,7 @@ class PagewalkArm64Command(PagewalkCommand):
         try:
             granule_bits = {0b00: 12, 0b01: 16, 0b10: 14}[TG0]
         except Exception:
-            self.err("Unsupported $TCR_EL3.TG0")
+            err("Unsupported $TCR_EL3.TG0")
             return
         region_start = 0
         region_end = region_start + (2 ** (64 - T0SZ))
@@ -51171,7 +49478,7 @@ class PagewalkArm64Command(PagewalkCommand):
             if self.FEAT_LPA:
                 translation_base_addr = (TTBR0_EL3 & 0xffffffffffc0) | (((TTBR0_EL3 >> 2) & 0b1111) << 48)
             else:
-                self.err("Unsupported FEAT_LPA and PS pair")
+                err("Unsupported FEAT_LPA and PS pair")
                 return
         else:
             translation_base_addr = TTBR0_EL3 & 0xfffffffffffe
@@ -51183,17 +49490,14 @@ class PagewalkArm64Command(PagewalkCommand):
         self.quiet_info('EL3 Page Size: {:d}KB (per page)'.format(page_size))
 
         self.parse_bit_range(granule_bits, region_bits)
-        if not self.use_cache or not self.ttbr0el3_mappings:
-            self.do_pagewalk(translation_base_addr, granule_bits, region_start)
-            self.merging()
-            self.ttbr0el3_mappings = self.mappings.copy()
-        self.make_out(self.ttbr0el3_mappings)
+        self.do_pagewalk(translation_base_addr, granule_bits, region_start)
+        self.print_page()
         return
 
     def pagewalk_init(self):
         res = gdb.execute("info registers", to_string=True)
         if "TTBR" not in res:
-            self.err("Not found system registers. Check qemu version (at least: 3.x~, recommend: 5.x~).")
+            err("Not found system registers. Check qemu version (at least: 3.x~, recommend: 5.x~).")
             return
 
         SCTLR_EL1 = get_register('$SCTLR_EL1')
@@ -51271,15 +49575,11 @@ class PagewalkArm64Command(PagewalkCommand):
         # parse system registers
         self.pagewalk_init()
 
-        self.silent = False
-        self.mappings = None
-        self.el2_mappings = None
-
         # TODO implementation for VSTTBR_EL2, VSTCR_EL2 pattern
 
         # do pagewalk
         if self.TargetEL < 1 or 3 < self.TargetEL:
-            self.warn('No paging in EL{:d}'.format(self.TargetEL))
+            warn('No paging in EL{:d}'.format(self.TargetEL))
             return
         if self.TargetEL == 1 and self.EL1_M:
             if self.EL2_VM:
@@ -51287,8 +49587,7 @@ class PagewalkArm64Command(PagewalkCommand):
                 self.silent = True
                 self.pagewalk_VTTBR_EL2()
                 if self.mappings:
-                    self.el2_mappings = self.mappings.copy()
-                    self.mappings = None
+                    self.el2_mappings = self.mappings
                 self.silent = False
             self.pagewalk_TTBR0_EL1()
             self.pagewalk_TTBR1_EL1()
@@ -51332,22 +49631,24 @@ class PagewalkArm64Command(PagewalkCommand):
         self.sort_by_phys = args.sort_by_phys
         self.simple = args.simple
         self.filter = args.filter
-        self.vrange = args.vrange.copy()
-        self.prange = args.prange.copy()
-        self.trace = args.trace.copy()
-        self.use_cache = args.use_cache
+        self.vrange = args.vrange
+        self.prange = args.prange
+        self.trace = args.trace
         if self.trace:
             self.vrange.extend(self.trace) # also set --vrange
             self.print_each_level = True # overwrite
-            self.use_cache = False # overwrite
-
-        self.out = []
+        self.use_pager = args.use_pager
         self.cache = {}
+
+        self.silent = False
+        self.mappings = None
+        self.el2_mappings = None
+        self.out = []
         self.pagewalk()
         self.cache = {}
 
         if self.out:
-            gef_print('\n'.join(self.out), less=not args.no_pager)
+            gef_print('\n'.join(self.out), less=self.use_pager)
         return
 
 
@@ -51649,6 +49950,7 @@ class ExecUntilCallCommand(ExecUntilCommand):
     _example_ = None
 
     def __init__(self):
+        gdb.execute("ni")
         super().__init__(prefix=False)
         self.mode = "call"
         return
@@ -52661,7 +50963,7 @@ class KsymaddrRemoteApplyCommand(GenericCommand):
         self.dont_repeat()
 
         info("Wait for memory scan")
-        res = gdb.execute("ksymaddr-remote --quiet", to_string=True)
+        res = gdb.execute("ksymaddr-remote --print-all", to_string=True)
         function_info = []
         for entry in res.splitlines():
             r = re.findall(r"(0x\w+) (\w) (\w+)", entry)
@@ -53224,7 +51526,6 @@ class GefFunctionsCommand(GenericCommand):
         gef_print(self.__doc__)
         return
 
-
 class GefCommand(gdb.Command):
     """GEF main command: view all new commands by typing `gef`."""
     _cmdline_ = "gef"
@@ -53405,8 +51706,8 @@ class GefHelpCommand(gdb.Command):
 
     def invoke(self, args, from_tty):
         self.dont_repeat()
-        msg = titlify("GEF - GDB Enhanced Features") + "\n" + self.__doc__
-        gef_print(msg, less=True)
+        gef_print(titlify("GEF - GDB Enhanced Features"))
+        gef_print(self.__doc__)
         return
 
     def generate_help(self, commands):
@@ -53429,6 +51730,7 @@ class GefHelpCommand(gdb.Command):
             aliases = ""
         msg = "  {cmd:<23s} -- {help:s}{aliases:s}".format(cmd=cmd, help=Color.greenify(doc), aliases=aliases)
         category = class_name._category_ if hasattr(class_name, "_category_") else "Uncategorized"
+
         self.docs.append([category, msg])
         return
 
@@ -53437,7 +51739,7 @@ class GefHelpCommand(gdb.Command):
         newdoc = ""
         old_category = None
         for category, msg in sorted(self.docs):
-            if old_category is None or old_category.split("-")[0] != category.split("-")[0]:
+            if old_category is None or old_category.split("-")[0] != category.split("-")[0] and "." in category:
                 newdoc += titlify(category.split(". ")[1].split(" - ")[0]) + "\n"
             if old_category != category:
                 newdoc += "[{:s}]\n".format(Color.colorify(category, "bold yellow"))

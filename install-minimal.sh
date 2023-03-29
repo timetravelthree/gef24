@@ -1,21 +1,18 @@
 #!/bin/sh -eux
 
-if [ ! $(id -u) = 0 ]; then
-  echo "[-] Detected non-root user, install failed."
-  exit 1
-fi
+GEF24_INSTALLATION_PATH="${HOME}/.gdbinit-gef24.py"
 
 echo "[+] apt"
 apt-get update
 apt-get install -y gdb-multiarch binutils gcc file
 
 echo "[+] download gef"
-wget -q https://raw.githubusercontent.com/bata24/gef/dev/gef.py -O /root/.gdbinit-gef.py
+wget -q https://raw.githubusercontent.com/timetravelthree/gef24/dev/gef.py -O "${GEF24_INSTALLATION_PATH}"
 
 echo "[+] setup gef"
-STARTUP_COMMAND="source /root/.gdbinit-gef.py"
-if [ ! -e /root/.gdbinit ] || [ "x$(grep "$STARTUP_COMMAND" /root/.gdbinit)" = "x" ]; then
-  echo "$STARTUP_COMMAND" >> /root/.gdbinit
+STARTUP_COMMAND="source ${GEF24_INSTALLATION_PATH}"
+if [ ! -e "${HOME}/.gdbinit" ] || grep -q "${STARTUP_COMMAND}" "${HOME}/.gdbinit"; then
+	echo "${STARTUP_COMMAND}" >>"${HOME}/.gdbinit"
 fi
 
 exit 0
