@@ -3,7 +3,7 @@ The aim of this fork is to add some additional features to the already existing 
 
 ## Acknowledgements
 
-This repository is a fork of [GEF](https://github.com/bata24/gef) from `@bata_24`, which is derived from the original [GEF](https://github.com/hugsy/gef) by `@hugsy`
+This repository is a fork of [GEF](https://github.com/bata24/gef) by `@bata_24`, which is derived from the original [GEF](https://github.com/hugsy/gef) by `@hugsy`
 
 ## Setup
 

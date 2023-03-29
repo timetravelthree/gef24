@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/bin/sh -eu
 
 GEF24_INSTALLATION_PATH="${HOME}/.gdbinit-gef24.py"
 
@@ -8,22 +8,19 @@ SUCCESSF=$(tput setaf 46)
 SUCCESSB=
 RESET=$(tput sgr0)
 
-
 # Simple log function
-function log() {
-        typem=$2
-        message=$1
-        case $typem in
-        info)
-                echo "${INFOB}${INFOF}[?] Info: ${RESET}${INFOB} $message ${RESET}"
-                ;;
-        success)
-                echo "${SUCCESSB}${SUCCESSF}[@] Success: ${RESET}${SUCCESSB} $message ${RESET}"
-                ;;
-        esac
-
+log() {
+	typem=$2
+	message=$1
+	case $typem in
+	info)
+		echo "${INFOB}${INFOF}[?] Info: ${RESET}${INFOB} $message ${RESET}"
+		;;
+	success)
+		echo "${SUCCESSB}${SUCCESSF}[@] Success: ${RESET}${SUCCESSB} $message ${RESET}"
+		;;
+	esac
 }
-
 
 log "Installing Gef24!" info
 
@@ -34,7 +31,7 @@ set -x
 pip3 install ropper keystone-engine --break-system-packages
 set +x
 
-if [[ ! "$(command -v seccomp-tools)" ]]; then
+if [ ! "$(command -v seccomp-tools)" ]; then
 	log "Installing seccomp-tools" info
 	set -x gem install --user seccomp-tools
 	set +x
@@ -42,7 +39,7 @@ else
 	log "Detected seccomp-tools, skipping..." info
 fi
 
-if [[ ! "$(command -v one_gadget)" ]]; then
+if [ ! "$(command -v one_gadget)" ]; then
 	log "Installing one_gadget" info
 	set -x
 	gem install --user one_gadget
@@ -52,7 +49,7 @@ else
 fi
 
 log "Installing rp++" info
-if [[ "$(uname -m)" == "x86_64" ]]; then
+if [ "$(uname -m)" = "x86_64" ]; then
 	if [ ! "$(command -v rp-lin)" ]; then
 		set -x
 		wget -q https://github.com/0vercl0k/rp/releases/download/v2.1.1/rp-lin-clang.zip -P /tmp
@@ -66,7 +63,7 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
 fi
 
 log "Installing vmlinux-to-elf" info
-if [[ ! "$(command -v vmlinux-to-elf)" ]]; then
+if [ ! "$(command -v vmlinux-to-elf)" ]; then
 	set -x
 	pip3 install --user --upgrade lz4 zstandard git+https://github.com/clubby789/python-lzo@b4e39df git+https://github.com/marin-m/vmlinux-to-elf --break-system-packages
 	set +x
@@ -81,11 +78,11 @@ log "Setting up" info
 STARTUP_COMMAND="source ${GEF24_INSTALLATION_PATH}"
 
 if [ -e "${HOME}/.gdbinit" ] && grep -q "${STARTUP_COMMAND}" "${HOME}/.gdbinit"; then
-		log "Gef24 seems to be already installed" info	
+	log "Gef24 seems to be already installed" info
 else
 	set -x
 
-	cat << EOH >> "${HOME}/.gdbinit"
+	cat <<EOH >>"${HOME}/.gdbinit"
 
 # --Gef24 source file--
 
@@ -107,7 +104,7 @@ fi
 
 log "Installing Gef24 script" info
 set -x
-cat << EOH > "${HOME}/.local/bin/gef24"
+cat <<EOH >"${HOME}/.local/bin/gef24"
 #!/bin/sh
 #exec gdb -q -ex init-gef24 "$@"
 EOH
